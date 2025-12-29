@@ -13,6 +13,8 @@ ed25519-dalek = { version = "1", default-features = false, features = ["std", "u
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 hex = "0.4"
+rustls = { version = "0.21", optional = true }
+rustls-pemfile = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile = "3.10"
@@ -20,3 +22,4 @@ tempfile = "3.10"
 [features]
 default = []
 trace_check = ["serde", "serde_json"]
+bft = ["serde", "serde_json", "rustls", "rustls-pemfile"]

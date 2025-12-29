@@ -11,6 +11,7 @@ pub enum ValidationError {
     TimestampNonMonotonic,
 }
 
+#[derive(Clone)]
 pub struct ValidationContext {
     pub last_timestamp: u64,
 }

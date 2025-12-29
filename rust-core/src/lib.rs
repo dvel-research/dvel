@@ -7,6 +7,8 @@ pub mod scoring;
 pub mod storage;
 #[cfg(feature = "trace_check")]
 pub mod trace_check;
+#[cfg(feature = "bft")]
+pub mod bft;
 pub mod validation;
 
 // Global constants for determinism

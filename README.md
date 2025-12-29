@@ -31,7 +31,24 @@ cmake --build cpp-sim/build
 cmake -S examples -B examples/build
 cmake --build examples/build
 ./examples/build/ffi_minimal
+
+# Permissioned BFT node (experimental)
+cargo run --release --features bft --bin dvel-bft-node \
+  --genesis /path/to/genesis.json \
+  --key-hex <32-byte-secret-hex> \
+  --listen 127.0.0.1:9001 \
+  --client 127.0.0.1:7001 \
+  --data-dir /path/to/node-data \
+  --tls-cert /path/to/node.crt \
+  --tls-key /path/to/node.key
 ```
+If `transport.tls_enabled` is true in `genesis.json`, each validator must include
+`tls_cert_hex` (DER hex); the cert must include the listen host in SAN (IP or DNS) and
+should be self-signed CA or chain to a private CA used as a trust anchor.
+You can generate a self-signed cert with `openssl`:
+`./scripts/gen_tls_selfsigned.sh /path/to/out 127.0.0.1 node1`
+If `--data-dir` is omitted, the node stores snapshots under `data/<node_id_hex>`.
+Snapshots are stored as `bft_snapshot.json` inside the data directory.
 
 ## FFI surface
 Header: `include/dvel_ffi.h` (see `docs/ffi_reference.md` for details).
@@ -44,6 +61,9 @@ Header: `include/dvel_ffi.h` (see `docs/ffi_reference.md` for details).
 - `cargo fmt` and `cargo clippy --release -- -D warnings`
 - `cargo test --release -p rust_core`
 - `./scripts/smoke.sh`
+
+## BFT design notes
+See `docs/bft_design.md` for protocol parameters, genesis format, and API usage.
 
 ## Design sketch (why it’s deterministic)
 - No wall-clock reads: time is injected (`timestamp`/`tick`).

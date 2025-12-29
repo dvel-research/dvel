@@ -79,6 +79,11 @@ impl Ledger {
         self.events.get(hash)
     }
 
+    /// Snapshot of all event hashes.
+    pub fn hashes_set(&self) -> HashSet<Hash> {
+        self.events.keys().cloned().collect()
+    }
+
     /// Snapshot copy of current tips (small set; OK for sim).
     pub fn get_tips(&self) -> HashSet<Hash> {
         self.tips.clone()

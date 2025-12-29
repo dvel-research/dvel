@@ -15,3 +15,6 @@ Makefile
 *.out
 *.out.*
 trace_*.json
+
+# BFT node data
+data/

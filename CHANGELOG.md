@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+- BFT: permissioned Tendermint-style prototype with HTTP client API and round-based finality checks.
+- BFT security: optional mTLS transport with pinned validator certs in genesis and CLI wiring for cert/key files.
+- BFT persistence: snapshot storage for blocks/tx index with replay on restart; `--data-dir` CLI flag and default `data/<node_id_hex>`.
+- Tooling: multi-node BFT integration test and TLS helper scripts for self-signed certs and cert hex.
+- Docs: expanded BFT design notes, TLS requirements, and persistence behavior.
+
 ## v0.1.0 — Reference prototype (deterministic, FFI-first)
 - Ledger: linkage-aware insert, tips tracking, Merkle root over event hashes; `Default` impl added.
 - Validation: ed25519 signature, protocol version, bounded timestamp skew; `Default` impl for `ValidationContext`.
