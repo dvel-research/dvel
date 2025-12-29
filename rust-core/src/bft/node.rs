@@ -202,14 +202,6 @@ impl PeerStream {
             }
         }
     }
-
-    fn shutdown(&mut self) {
-        let _ = match self {
-            PeerStream::Plain(stream) => stream.shutdown(std::net::Shutdown::Both),
-            PeerStream::TlsServer(stream) => stream.get_ref().shutdown(std::net::Shutdown::Both),
-            PeerStream::TlsClient(stream) => stream.get_ref().shutdown(std::net::Shutdown::Both),
-        };
-    }
 }
 
 
@@ -927,12 +919,12 @@ fn build_tls_config(identity: TlsIdentity, validators: &[ValidatorInfo]) -> Resu
     let client = ClientConfig::builder()
         .with_safe_defaults()
         .with_root_certificates(roots.clone())
-        .with_single_cert(identity.cert_chain.clone(), identity.key.clone())
+        .with_client_auth_cert(identity.cert_chain.clone(), identity.key.clone())
         .map_err(|_| "invalid tls key or certificate".to_string())?;
 
     let server = ServerConfig::builder()
         .with_safe_defaults()
-        .with_client_cert_verifier(AllowAnyAuthenticatedClient::new(roots))
+        .with_client_cert_verifier(Arc::new(AllowAnyAuthenticatedClient::new(roots)))
         .with_single_cert(identity.cert_chain, identity.key)
         .map_err(|_| "invalid tls key or certificate".to_string())?;
 

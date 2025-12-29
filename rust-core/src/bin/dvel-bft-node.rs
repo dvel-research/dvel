@@ -120,8 +120,10 @@ fn main() {
 }
 
 #[cfg(feature = "bft")]
-fn load_tls_identity(cert_path: &str, key_path: &str) -> Result<TlsIdentity, String> {
-    use dvel_core::bft::node::TlsIdentity;
+fn load_tls_identity(
+    cert_path: &str,
+    key_path: &str,
+) -> Result<dvel_core::bft::node::TlsIdentity, String> {
     use rustls::{Certificate, PrivateKey};
     use std::fs::File;
     use std::io::BufReader;
@@ -141,7 +143,7 @@ fn load_tls_identity(cert_path: &str, key_path: &str) -> Result<TlsIdentity, Str
         return Err("no pkcs8 private key found".into());
     }
 
-    Ok(TlsIdentity {
+    Ok(dvel_core::bft::node::TlsIdentity {
         cert_chain: certs.into_iter().map(Certificate).collect(),
         key: PrivateKey(keys[0].clone()),
     })
