@@ -254,8 +254,13 @@ impl Node {
             snapshot,
             net,
             store,
-            slashing_state,
+            slashing_state: slashing_state.clone(),
         };
+
+        // Initialize slashing_state in snapshot
+        if let Ok(mut snap) = node.snapshot.write() {
+            snap.slashing_state = Some(slashing_state);
+        }
 
         node.restore_from_store()?;
 
@@ -410,6 +415,11 @@ impl Node {
         }
         let v = &signed.vote;
         if v.height != self.height || v.round != self.round {
+            return;
+        }
+
+        // Reject votes from jailed validators
+        if self.slashing_state.is_jailed(&v.validator_id, self.height) {
             return;
         }
 
@@ -720,6 +730,12 @@ impl Node {
         } else {
             snap.height = persisted.height;
             snap.tip_hash = persisted.tip_hash;
+        }
+
+        // Restore slashing state from persisted snapshot
+        snap.slashing_state = persisted.slashing_state.clone();
+        if let Some(ref restored_slashing) = snap.slashing_state {
+            self.slashing_state = restored_slashing.clone();
         }
 
         let next_height = snap.height.saturating_add(1);
@@ -1119,6 +1135,7 @@ fn snapshot_to_persisted(snapshot: &NodeSnapshot) -> PersistedSnapshot {
         height: snapshot.height,
         tip_hash: snapshot.tip_hash,
         blocks,
+        slashing_state: snapshot.slashing_state.clone(),
     }
 }
 

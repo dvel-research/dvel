@@ -1,10 +1,11 @@
 use crate::bft::config::SlashingConfig;
 use crate::bft::types::{NodeId, SignedVote, SlashingEvidence, SlashingRecord, VoteType};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Tracks validator stakes and slashing history
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SlashingState {
     /// Current stake per validator (after slashing)
     pub stakes: HashMap<NodeId, u64>,
@@ -65,15 +66,19 @@ impl SlashingState {
         // Check for double-signing: same height/round/type but different block hash
         if let Some(existing) = votes.get(&v.validator_id) {
             if existing.vote.block_hash != v.block_hash {
-                // Double-sign detected!
-                return Some(SlashingEvidence::DoubleSign {
+                // Double-sign detected! Clone evidence data before mutating
+                let evidence = Some(SlashingEvidence::DoubleSign {
                     validator_id: v.validator_id,
                     height: v.height,
                     round: v.round,
                     vote1: existing.clone(),
                     vote2: vote.clone(),
                 });
+                // Store the second vote to prevent re-detection
+                votes.insert(v.validator_id, vote.clone());
+                return evidence;
             }
+            // Same vote as existing - ignore duplicate
         } else {
             votes.insert(v.validator_id, vote.clone());
         }

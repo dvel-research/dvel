@@ -418,6 +418,8 @@ impl SybilOverlay {
         if cfg.policy == EquivocationPolicy::Slash {
             let slash_amount = (cfg.fixed_point_scale * cfg.slash_percent) / 100;
             st.slashed_weight = st.slashed_weight.saturating_add(slash_amount);
+            // Cap at fixed_point_scale to prevent overflow and ensure penalty stays at 100%
+            st.slashed_weight = st.slashed_weight.min(cfg.fixed_point_scale);
         }
     }
 

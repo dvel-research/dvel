@@ -1,3 +1,4 @@
+use crate::bft::slashing::SlashingState;
 use crate::bft::types::Block;
 use crate::event::Hash;
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,7 @@ pub struct PersistedSnapshot {
     pub height: u64,
     pub tip_hash: Hash,
     pub blocks: Vec<Block>,
+    pub slashing_state: Option<SlashingState>,
 }
 
 pub struct SnapshotStore {
