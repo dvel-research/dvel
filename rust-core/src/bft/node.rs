@@ -1,4 +1,5 @@
 use crate::bft::config::GenesisConfig;
+use crate::bft::slashing::SlashingState;
 use crate::bft::storage::{PersistedSnapshot, SnapshotStore};
 use crate::bft::types::{
     block_hash, merkle_root_hashes, node_id_from_pubkey, proposal_bytes, tx_hash, vote_bytes,
@@ -40,6 +41,7 @@ pub struct NodeSnapshot {
     pub blocks_by_height: HashMap<u64, Block>,
     pub blocks_by_hash: HashMap<Hash, Block>,
     pub tx_index: HashMap<Hash, (Hash, u64)>,
+    pub slashing_state: Option<SlashingState>,
 }
 
 impl NodeSnapshot {
@@ -50,6 +52,7 @@ impl NodeSnapshot {
             blocks_by_height: HashMap::new(),
             blocks_by_hash: HashMap::new(),
             tx_index: HashMap::new(),
+            slashing_state: None,
         }
     }
 }
@@ -147,6 +150,7 @@ pub struct Node {
     snapshot: Arc<RwLock<NodeSnapshot>>,
     net: Network,
     store: Option<SnapshotStore>,
+    slashing_state: SlashingState,
 }
 
 struct TlsConfig {
@@ -224,6 +228,14 @@ impl Node {
             None => None,
         };
 
+        // Initialize slashing state with validator stakes
+        let validator_infos = genesis.validator_infos()?;
+        let mut initial_stakes = HashMap::new();
+        for v in &validator_infos {
+            initial_stakes.insert(v.node_id, v.stake);
+        }
+        let slashing_state = SlashingState::new(initial_stakes);
+
         let mut node = Self {
             genesis,
             validators,
@@ -242,6 +254,7 @@ impl Node {
             snapshot,
             net,
             store,
+            slashing_state,
         };
 
         node.restore_from_store()?;
@@ -398,6 +411,38 @@ impl Node {
         let v = &signed.vote;
         if v.height != self.height || v.round != self.round {
             return;
+        }
+
+        // Check for double-signing and apply slashing if detected
+        if let Some(evidence) = self.slashing_state.record_vote(
+            &signed,
+            &self.genesis.consensus.slashing,
+            self.height,
+        ) {
+            eprintln!(
+                "SLASHING DETECTED: Double-sign by validator {:?} at height {} round {}",
+                v.validator_id, v.height, v.round
+            );
+            
+            match self.slashing_state.slash(
+                evidence.clone(),
+                &self.genesis.consensus.slashing,
+                self.height,
+            ) {
+                Ok(record) => {
+                    eprintln!(
+                        "Validator slashed: {} stake removed, jailed until height {}",
+                        record.slashed_amount, record.jail_until_height
+                    );
+                    // Update snapshot with slashing state
+                    if let Ok(mut snap) = self.snapshot.write() {
+                        snap.slashing_state = Some(self.slashing_state.clone());
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Slashing failed: {}", e);
+                }
+            }
         }
 
         let vote_set = match v.vote_type {

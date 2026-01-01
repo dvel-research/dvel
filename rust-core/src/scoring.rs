@@ -188,12 +188,13 @@ pub fn select_preferred_tip_score(
 }
 
 // ------------------------
-// Sybil overlay: warm-up + equivocation quarantine
+// Sybil overlay: warm-up + equivocation quarantine + economic penalties
 // ------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EquivocationPolicy {
     Quarantine,
+    Slash,
 }
 
 #[derive(Clone, Debug)]
@@ -203,6 +204,7 @@ pub struct SybilConfig {
     pub policy: EquivocationPolicy,
     pub fixed_point_scale: u64,
     pub max_link_walk: usize,
+    pub slash_percent: u64, // Percentage of weight to slash for equivocation (0-100)
 }
 
 impl Default for SybilConfig {
@@ -213,6 +215,7 @@ impl Default for SybilConfig {
             policy: EquivocationPolicy::Quarantine,
             fixed_point_scale: 1000,
             max_link_walk: 4096,
+            slash_percent: 5, // 5% economic penalty
         }
     }
 }
@@ -223,6 +226,7 @@ struct AuthorState {
     seen_by: HashSet<u32>,
     last_tip: Option<Hash>,
     quarantined_until: u64,
+    slashed_weight: u64, // Cumulative slashed amount (fixed-point)
 }
 
 #[derive(Clone, Debug)]
@@ -279,6 +283,7 @@ impl AuthorState {
             seen_by: HashSet::new(),
             last_tip: None,
             quarantined_until: 0,
+            slashed_weight: 0,
         }
     }
 }
@@ -335,8 +340,8 @@ impl SybilOverlay {
             ancestor_linked = linked;
 
             if !linked {
-                // Fork sibling detected (divergent children of the same author): trigger quarantine window.
-                Self::apply_quarantine(st, tick, quarantine_ticks);
+                // Fork sibling detected (divergent children of the same author): trigger quarantine + slashing.
+                Self::apply_quarantine_and_slash(st, tick, quarantine_ticks, &self.cfg);
             }
         }
 
@@ -381,7 +386,15 @@ impl SybilOverlay {
         }
 
         let warm = self.author_warmup(tick, st);
-        warm.clamp(0.0, 1.0)
+        let base_weight = warm.clamp(0.0, 1.0);
+        
+        // Apply economic penalty from slashing
+        let slashed_fp = st.slashed_weight as f64;
+        let scale = self.cfg.fixed_point_scale as f64;
+        let penalty = (slashed_fp / scale).clamp(0.0, 1.0);
+        
+        // Reduce weight by slashed amount
+        (base_weight * (1.0 - penalty)).clamp(0.0, 1.0)
     }
 
     pub fn author_weight_fp(&self, tick: u64, author: PublicKey) -> u64 {
@@ -390,9 +403,22 @@ impl SybilOverlay {
             .clamp(0, self.cfg.fixed_point_scale as i64) as u64
     }
 
+    #[allow(dead_code)]
     fn apply_quarantine(st: &mut AuthorState, tick: u64, quarantine_ticks: u64) {
         let until = tick.saturating_add(quarantine_ticks);
         st.quarantined_until = st.quarantined_until.max(until);
+    }
+
+    fn apply_quarantine_and_slash(st: &mut AuthorState, tick: u64, quarantine_ticks: u64, cfg: &SybilConfig) {
+        // Apply quarantine
+        let until = tick.saturating_add(quarantine_ticks);
+        st.quarantined_until = st.quarantined_until.max(until);
+        
+        // Apply economic slash if configured
+        if cfg.policy == EquivocationPolicy::Slash {
+            let slash_amount = (cfg.fixed_point_scale * cfg.slash_percent) / 100;
+            st.slashed_weight = st.slashed_weight.saturating_add(slash_amount);
+        }
     }
 
     fn author_warmup(&self, tick: u64, st: &AuthorState) -> f64 {

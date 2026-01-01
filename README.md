@@ -1,12 +1,21 @@
-# DVEL Reference (v0.1.0)
+# DVEL Reference (v0.1.1)
 
-Deterministic, in-memory event ledger with a sybil-aware overlay, exposed over a C ABI for C++ simulations and tooling. This repo is a reference prototype: small surface area, no wall-clock dependencies, and an audit-first design (traceable hashes/Merkle roots).
+Deterministic, in-memory event ledger with staking and slashing. Exposed over C ABI for C++ simulations. Audit-first design (traceable hashes/Merkle roots).
+
+## v0.1.1 changes
+- Validator staking (configurable per-validator)
+- Automatic double-sign detection and slashing (5% penalty default)
+- Jail mechanism (1000 blocks default)
+- Economic penalties in SybilOverlay
+
+See `docs/STAKING_AND_SLASHING.md` for slashing implementation.
 
 ## What it does
 - **Events**: single-parent DAG with hash identity `H = SHA256(C(event) || signature)`, where `C` omits the signature slot.
 - **Ledger**: linkage-aware insert (rejects duplicates/missing parents), tips tracking, Merkle root over all event hashes.
 - **Validation**: protocol version, ed25519 signature, bounded timestamp skew (monotonic within a per-author context).
-- **Sybil overlay**: latest-per-author weights plus quarantine on equivocation; preferred-tip selection that respects author weights.
+- **Sybil overlay**: latest-per-author weights plus quarantine + economic slashing on equivocation.
+- **BFT Consensus**: Tendermint-style with staking, automatic slashing, and jail mechanism.
 - **Storage helper**: chunk/sign/verify files, compute manifest hash and chunk Merkle root for anchoring/audit.
 
 ## Build & run
@@ -72,4 +81,9 @@ See `docs/bft_design.md` for protocol parameters, genesis format, and API usage.
 - Merkle root over sorted event hashes gives a stable commitment for audit.
 
 ## Versioning
-Current version: **v0.1.0** (reference prototype; not hardened for production security).
+Current version: **v0.1.1** (massive impact: economic security)
+
+Limitations addressed:
+- Sybil resistance: validator staking requirement (default 1M units)
+- Economic finality: slashing (5% per double-sign) + jail (1000 blocks)
+- Production crypto: ed25519-dalek (reference-grade; external audit recommended)

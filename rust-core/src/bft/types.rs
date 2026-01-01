@@ -13,6 +13,7 @@ pub struct ValidatorInfo {
     pub node_id: NodeId,
     pub address: String,
     pub power: u64,
+    pub stake: u64,
     pub tls_cert: Option<Vec<u8>>,
 }
 
@@ -23,7 +24,7 @@ pub fn node_id_from_pubkey(pubkey: &PublicKey) -> NodeId {
 }
 
 #[cfg_attr(feature = "bft", derive(Serialize, Deserialize))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum VoteType {
     Prevote,
     Precommit,
@@ -85,6 +86,33 @@ pub enum Message {
     Tx { tx: Vec<u8> },
     Proposal(Proposal),
     Vote(SignedVote),
+}
+
+#[cfg_attr(feature = "bft", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug)]
+pub enum SlashingEvidence {
+    DoubleSign {
+        validator_id: NodeId,
+        height: u64,
+        round: u64,
+        vote1: SignedVote,
+        vote2: SignedVote,
+    },
+    InvalidProposal {
+        validator_id: NodeId,
+        height: u64,
+        proposal: Proposal,
+        reason: String,
+    },
+}
+
+#[cfg_attr(feature = "bft", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug)]
+pub struct SlashingRecord {
+    pub evidence: SlashingEvidence,
+    pub slashed_amount: u64,
+    pub jail_until_height: u64,
+    pub timestamp_ms: u64,
 }
 
 pub fn tx_hash(tx: &[u8]) -> Hash {

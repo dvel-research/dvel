@@ -27,6 +27,12 @@ pub struct ValidatorConfig {
     pub power: u64,
     #[cfg_attr(feature = "bft", serde(default))]
     pub tls_cert_hex: Option<String>,
+    #[cfg_attr(feature = "bft", serde(default = "default_stake"))]
+    pub stake: u64,
+}
+
+fn default_stake() -> u64 {
+    1_000_000
 }
 
 #[cfg_attr(feature = "bft", derive(Serialize, Deserialize))]
@@ -41,6 +47,48 @@ pub struct ConsensusConfig {
     pub timeout_backoff_num: u64,
     pub timeout_backoff_den: u64,
     pub timeout_cap_ms: u64,
+    #[cfg_attr(feature = "bft", serde(default))]
+    pub slashing: SlashingConfig,
+}
+
+#[cfg_attr(feature = "bft", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug)]
+pub struct SlashingConfig {
+    #[cfg_attr(feature = "bft", serde(default = "default_slash_enabled"))]
+    pub enabled: bool,
+    #[cfg_attr(feature = "bft", serde(default = "default_double_sign_slash"))]
+    pub double_sign_percent: u64,
+    #[cfg_attr(feature = "bft", serde(default = "default_invalid_proposal_slash"))]
+    pub invalid_proposal_percent: u64,
+    #[cfg_attr(feature = "bft", serde(default = "default_jail_duration"))]
+    pub jail_duration_blocks: u64,
+}
+
+fn default_slash_enabled() -> bool {
+    true
+}
+
+fn default_double_sign_slash() -> u64 {
+    5 // 5% of stake
+}
+
+fn default_invalid_proposal_slash() -> u64 {
+    1 // 1% of stake
+}
+
+fn default_jail_duration() -> u64 {
+    1000 // blocks
+}
+
+impl Default for SlashingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_slash_enabled(),
+            double_sign_percent: default_double_sign_slash(),
+            invalid_proposal_percent: default_invalid_proposal_slash(),
+            jail_duration_blocks: default_jail_duration(),
+        }
+    }
 }
 
 impl Default for ConsensusConfig {
@@ -55,6 +103,7 @@ impl Default for ConsensusConfig {
             timeout_backoff_num: 3,
             timeout_backoff_den: 2,
             timeout_cap_ms: 10_000,
+            slashing: SlashingConfig::default(),
         }
     }
 }
@@ -94,6 +143,7 @@ impl GenesisConfig {
             let pubkey = parse_pubkey(&v.pubkey_hex)?;
             let node_id = node_id_from_pubkey(&pubkey);
             let power = if v.power == 0 { 1 } else { v.power };
+            let stake = if v.stake == 0 { default_stake() } else { v.stake };
             let tls_cert = match &v.tls_cert_hex {
                 Some(hex) => Some(parse_tls_cert(hex)?),
                 None => None,
@@ -106,6 +156,7 @@ impl GenesisConfig {
                 node_id,
                 address: v.address.clone(),
                 power,
+                stake,
                 tls_cert,
             });
         }

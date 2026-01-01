@@ -56,6 +56,7 @@ fn genesis_from_secrets(secrets: &[[u8; 32]], addrs: &[String]) -> GenesisConfig
             pubkey_hex: hex::encode(public.to_bytes()),
             address: addr.clone(),
             power: 1,
+            stake: 1_000_000,
             tls_cert_hex: None,
         });
     }

@@ -679,6 +679,7 @@ pub extern "C" fn dvel_sybil_overlay_set_config(
             policy: EquivocationPolicy::Quarantine,
             fixed_point_scale: c.fixed_point_scale,
             max_link_walk: c.max_link_walk,
+            slash_percent: 5, // Default 5% economic penalty
         };
     }
 }

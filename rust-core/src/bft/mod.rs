@@ -3,5 +3,6 @@
 pub mod config;
 pub mod http;
 pub mod node;
+pub mod slashing;
 pub mod storage;
 pub mod types;

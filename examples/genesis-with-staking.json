@@ -1,0 +1,56 @@
+{
+  "chain_id": "dvel-secure-testnet",
+  "validators": [
+    {
+      "pubkey_hex": "8c7e8c8c5c5e5f5d5b5a58565452504e4c4a48464442403e3c3a38363432302e",
+      "address": "127.0.0.1:9001",
+      "power": 1,
+      "stake": 10000000,
+      "tls_cert_hex": null
+    },
+    {
+      "pubkey_hex": "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b",
+      "address": "127.0.0.1:9002",
+      "power": 1,
+      "stake": 10000000,
+      "tls_cert_hex": null
+    },
+    {
+      "pubkey_hex": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
+      "address": "127.0.0.1:9003",
+      "power": 1,
+      "stake": 10000000,
+      "tls_cert_hex": null
+    },
+    {
+      "pubkey_hex": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "address": "127.0.0.1:9004",
+      "power": 1,
+      "stake": 10000000,
+      "tls_cert_hex": null
+    }
+  ],
+  "consensus": {
+    "max_block_bytes": 1048576,
+    "max_events": 5000,
+    "target_block_ms": 2000,
+    "propose_timeout_ms": 800,
+    "prevote_timeout_ms": 600,
+    "precommit_timeout_ms": 600,
+    "timeout_backoff_num": 3,
+    "timeout_backoff_den": 2,
+    "timeout_cap_ms": 10000,
+    "slashing": {
+      "enabled": true,
+      "double_sign_percent": 5,
+      "invalid_proposal_percent": 1,
+      "jail_duration_blocks": 1000
+    }
+  },
+  "client": {
+    "listen_addr": "127.0.0.1:7000"
+  },
+  "transport": {
+    "tls_enabled": false
+  }
+}
