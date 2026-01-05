@@ -112,19 +112,6 @@ See `docs/bft_design.md` for protocol parameters, genesis format, and API usage.
 - No shared mutable globals: ledger/overlay are caller-owned handles.
 - Merkle root over sorted event hashes gives a stable commitment for audit.
 
-## Versioning
-Current version: **v0.1.2** (massive impact: performance)
-
-Threading model:
-- Core libraries: single-threaded for determinism (default)
-- Parallel mode: hybrid threading with `--features parallel` (2-4x throughput)
-- BFT consensus: multi-threaded network I/O, deterministic state machine
-
-Limitations addressed:
-- Sybil resistance: validator staking requirement (default 1M units)
-- Economic finality: slashing (5% per double-sign) + jail (1000 blocks)
-- Production crypto: ed25519-dalek (reference-grade; external audit recommended)
-
 ## Government transparency deployment
 **gov_ledger**: production-ready configurable system for distributed government ledger.
 
@@ -150,29 +137,3 @@ Performance (BFT block processing):
 - Test: `cd rust-core && cargo bench --bench bft_throughput --features bft,parallel`
 
 Test files (`sim_*.cpp`) for protocol validation; `gov_ledger.cpp` for production deployment.
-
-## Attack Scenario Suite (Experimental)
-
-Security validation through adversarial simulation. **For research/experimental use only**, not production security testing.
-
-### Current Attacks
-
-1. **Eclipse Attack** (`sim_attack_eclipse`): Isolate victim node from honest majority
-   - Result: ✗ Attack FAILED - system resisted (8.3% divergence, 30-tick recovery)
-
-2. **51% Byzantine** (`sim_attack_51percent`): Test BFT safety threshold
-   - Strategies: double-spend, censorship, chain-reorg
-   - Status: Partial implementation (needs BFT tuning)
-
-3. **Sybil Flood** (`sim_attack_sybil_flood`): Flood network with low-stake identities
-   - Result: ✗ Partial SUCCESS - 6% acceptance, fragmented consensus
-   - 10x more sybil nodes, 1000x less stake each
-
-4. **Network Partition** (`sim_attack_partition`): Split network 50/50, test recovery
-   - Result: ATTACK SUCCEEDED - **vulnerability detected**
-   - System failed to converge after partition healed (173 divergent events)
-   - **Needs**: Partition recovery mechanism or finality gadget
-
-See `docs/attack_scenarios.md` for full threat model, metrics, and planned attacks (selfish validator).
-
-**WARNING**: Experimental research code with simplified threat models. Not exhaustive security testing.
