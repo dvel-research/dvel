@@ -1,4 +1,4 @@
-use crate::bft::types::{node_id_from_pubkey, ValidatorInfo};
+use crate::bft::types::{ValidatorInfo, node_id_from_pubkey};
 use crate::event::PublicKey;
 use hex::FromHex;
 
@@ -124,16 +124,10 @@ impl Default for ClientConfig {
 }
 
 #[cfg_attr(feature = "bft", derive(Serialize, Deserialize))]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct TransportConfig {
     #[cfg_attr(feature = "bft", serde(default))]
     pub tls_enabled: bool,
-}
-
-impl Default for TransportConfig {
-    fn default() -> Self {
-        Self { tls_enabled: false }
-    }
 }
 
 impl GenesisConfig {
@@ -143,7 +137,11 @@ impl GenesisConfig {
             let pubkey = parse_pubkey(&v.pubkey_hex)?;
             let node_id = node_id_from_pubkey(&pubkey);
             let power = if v.power == 0 { 1 } else { v.power };
-            let stake = if v.stake == 0 { default_stake() } else { v.stake };
+            let stake = if v.stake == 0 {
+                default_stake()
+            } else {
+                v.stake
+            };
             let tls_cert = match &v.tls_cert_hex {
                 Some(hex) => Some(parse_tls_cert(hex)?),
                 None => None,

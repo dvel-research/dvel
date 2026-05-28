@@ -87,7 +87,9 @@ pub fn score_chain_latest_per_author_unit(ledger: &Ledger, chain: &mut Chain) {
 
     // chain.hashes stored genesis->tip; iterate tip->genesis
     for h in chain.hashes.iter().rev() {
-        if let Some(e) = ledger.get_event(h) && seen.insert(e.author) {
+        if let Some(e) = ledger.get_event(h)
+            && seen.insert(e.author)
+        {
             s = s.saturating_add(1);
         }
     }
@@ -204,7 +206,7 @@ pub struct SybilConfig {
     pub policy: EquivocationPolicy,
     pub fixed_point_scale: u64,
     pub max_link_walk: usize,
-    pub slash_percent: u64, // Percentage of weight to slash for equivocation (0-100)
+    pub slash_percent: u64, // Percentage of weight to penalize for equivocation (0-100)
 }
 
 impl Default for SybilConfig {
@@ -215,7 +217,7 @@ impl Default for SybilConfig {
             policy: EquivocationPolicy::Quarantine,
             fixed_point_scale: 1000,
             max_link_walk: 4096,
-            slash_percent: 5, // 5% economic penalty
+            slash_percent: 5, // 5% authority weight penalty
         }
     }
 }
@@ -334,7 +336,9 @@ impl SybilOverlay {
         st.seen_by.insert(observer_node);
 
         let mut ancestor_linked = true;
-        if let Some(prev) = st.last_tip && prev != tip {
+        if let Some(prev) = st.last_tip
+            && prev != tip
+        {
             let linked = is_ancestor_by_walk(ledger, prev, tip, self.cfg.max_link_walk)
                 || is_ancestor_by_walk(ledger, tip, prev, self.cfg.max_link_walk);
             ancestor_linked = linked;
@@ -387,13 +391,13 @@ impl SybilOverlay {
 
         let warm = self.author_warmup(tick, st);
         let base_weight = warm.clamp(0.0, 1.0);
-        
-        // Apply economic penalty from slashing
+
+        // Apply reputation penalty from weight reduction
         let slashed_fp = st.slashed_weight as f64;
         let scale = self.cfg.fixed_point_scale as f64;
         let penalty = (slashed_fp / scale).clamp(0.0, 1.0);
-        
-        // Reduce weight by slashed amount
+
+        // Reduce weight by penalized amount
         (base_weight * (1.0 - penalty)).clamp(0.0, 1.0)
     }
 
@@ -409,12 +413,17 @@ impl SybilOverlay {
         st.quarantined_until = st.quarantined_until.max(until);
     }
 
-    fn apply_quarantine_and_slash(st: &mut AuthorState, tick: u64, quarantine_ticks: u64, cfg: &SybilConfig) {
+    fn apply_quarantine_and_slash(
+        st: &mut AuthorState,
+        tick: u64,
+        quarantine_ticks: u64,
+        cfg: &SybilConfig,
+    ) {
         // Apply quarantine
         let until = tick.saturating_add(quarantine_ticks);
         st.quarantined_until = st.quarantined_until.max(until);
-        
-        // Apply economic slash if configured
+
+        // Apply reputation-based weight penalization if configured
         if cfg.policy == EquivocationPolicy::Slash {
             let slash_amount = (cfg.fixed_point_scale * cfg.slash_percent) / 100;
             st.slashed_weight = st.slashed_weight.saturating_add(slash_amount);
@@ -477,7 +486,9 @@ pub fn score_chain_latest_per_author_sybil_fp(
     let mut s_fp: u64 = 0;
 
     for h in chain.hashes.iter().rev() {
-        if let Some(e) = ledger.get_event(h) && seen.insert(e.author) {
+        if let Some(e) = ledger.get_event(h)
+            && seen.insert(e.author)
+        {
             s_fp = s_fp.saturating_add(overlay.author_weight_fp(tick, e.author));
         }
     }

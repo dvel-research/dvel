@@ -1,7 +1,6 @@
-use dvel_core::ffi::*;
 use dvel_core::PROTOCOL_VERSION;
+use dvel_core::ffi::*;
 use std::ffi::CString;
-use std::os::unix::ffi::OsStrExt;
 use std::ptr;
 use tempfile::tempdir;
 
@@ -136,8 +135,8 @@ fn ffi_storage_round_trip() {
     std::fs::write(&input_path, b"ffi storage round trip").unwrap();
 
     let out_dir = dir.path().join("chunks");
-    let c_input = CString::new(input_path.as_os_str().as_bytes()).unwrap();
-    let c_out = CString::new(out_dir.as_os_str().as_bytes()).unwrap();
+    let c_input = CString::new(input_path.to_str().unwrap()).unwrap();
+    let c_out = CString::new(out_dir.to_str().unwrap()).unwrap();
 
     let ok = dvel_storage_chunk_file(c_input.as_ptr(), c_out.as_ptr(), 8, ptr::null(), false);
     assert!(ok, "chunk_file failed");
@@ -145,9 +144,9 @@ fn ffi_storage_round_trip() {
     let manifest_path = out_dir.join("input.bin.manifest");
     let rebuilt_path = dir.path().join("rebuilt.bin");
 
-    let c_manifest = CString::new(manifest_path.as_os_str().as_bytes()).unwrap();
-    let c_chunk_dir = CString::new(out_dir.as_os_str().as_bytes()).unwrap();
-    let c_rebuilt = CString::new(rebuilt_path.as_os_str().as_bytes()).unwrap();
+    let c_manifest = CString::new(manifest_path.to_str().unwrap()).unwrap();
+    let c_chunk_dir = CString::new(out_dir.to_str().unwrap()).unwrap();
+    let c_rebuilt = CString::new(rebuilt_path.to_str().unwrap()).unwrap();
 
     let ok = dvel_storage_download(
         c_manifest.as_ptr(),
@@ -174,4 +173,49 @@ fn ffi_storage_round_trip() {
     ));
     assert!(manifest_hash.bytes.iter().any(|b| *b != 0));
     assert!(chunk_root.bytes.iter().any(|b| *b != 0));
+}
+
+#[test]
+fn ffi_mmr_verification() {
+    let mut mmr = dvel_core::mmr::Mmr::new();
+    let mut leaves = Vec::new();
+    for i in 0..10 {
+        let mut leaf = [0u8; 32];
+        leaf[0] = i as u8;
+        mmr.append(leaf);
+        leaves.push(leaf);
+    }
+
+    let root = mmr.get_root().unwrap();
+    let proof = mmr.gen_proof(4).unwrap();
+
+    let c_root = dvel_hash_t { bytes: root };
+    let c_leaf = dvel_hash_t { bytes: leaves[4] };
+
+    let mut c_siblings = [dvel_hash_t { bytes: [0u8; 32] }; 64];
+    let mut c_sibling_is_right = [false; 64];
+    for (idx, &(sh, is_right)) in proof.siblings.iter().enumerate() {
+        c_siblings[idx] = dvel_hash_t { bytes: sh };
+        c_sibling_is_right[idx] = is_right;
+    }
+
+    let mut c_peaks = [dvel_hash_t { bytes: [0u8; 32] }; 64];
+    for (idx, &ph) in proof.peaks.iter().enumerate() {
+        c_peaks[idx] = dvel_hash_t { bytes: ph };
+    }
+
+    let c_proof = dvel_mmr_proof_t {
+        leaf_index: proof.leaf_index,
+        leaf_count: proof.leaf_count,
+        siblings: c_siblings,
+        siblings_count: proof.siblings.len() as u32,
+        sibling_is_right: c_sibling_is_right,
+        peaks: c_peaks,
+        peaks_count: proof.peaks.len() as u32,
+    };
+
+    assert!(dvel_mmr_verify_proof(&c_root, &c_leaf, &c_proof));
+
+    let bad_leaf = dvel_hash_t { bytes: [0xFF; 32] };
+    assert!(!dvel_mmr_verify_proof(&c_root, &bad_leaf, &c_proof));
 }

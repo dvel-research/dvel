@@ -15,7 +15,11 @@ find_program(CARGO cargo REQUIRED)
 get_filename_component(DVEL_ROOT_DIR "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 set(DVEL_RUST_CORE_DIR "${DVEL_ROOT_DIR}/rust-core")
 set(DVEL_RUST_TARGET_DIR "${DVEL_RUST_CORE_DIR}/target")
-set(DVEL_RUST_LIB "${DVEL_RUST_TARGET_DIR}/release/libdvel_core.a")
+if(WIN32 AND NOT MINGW)
+  set(DVEL_RUST_LIB "${DVEL_RUST_TARGET_DIR}/release/dvel_core.lib")
+else()
+  set(DVEL_RUST_LIB "${DVEL_RUST_TARGET_DIR}/release/libdvel_core.a")
+endif()
 
 add_custom_target(dvel_core_build ALL
   COMMAND "${CARGO}" build --release

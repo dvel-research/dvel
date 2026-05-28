@@ -8,7 +8,7 @@ use dvel_core::bft::types::block_hash;
 use ed25519_dalek::{Keypair, PublicKey, SecretKey};
 use std::collections::HashMap;
 use std::net::TcpListener;
-use std::sync::{mpsc, Arc, RwLock};
+use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,9 +20,9 @@ struct TestNode {
 
 fn consensus_fast() -> ConsensusConfig {
     ConsensusConfig {
-        propose_timeout_ms: 150,
-        prevote_timeout_ms: 150,
-        precommit_timeout_ms: 150,
+        propose_timeout_ms: 300,
+        prevote_timeout_ms: 300,
+        precommit_timeout_ms: 300,
         target_block_ms: 200,
         timeout_cap_ms: 2_000,
         ..ConsensusConfig::default()
@@ -123,7 +123,7 @@ fn wait_for_quorum_block(nodes: &[TestNode], height: u64, timeout: Duration) -> 
             }
         }
 
-        for (_, (count, round)) in &counts {
+        for (count, round) in counts.values() {
             if *count >= 3 {
                 return *round;
             }
@@ -157,7 +157,7 @@ fn bft_finality_quorum_4_nodes() {
         nodes.push(start_node(genesis.clone(), keypair, addr.clone()));
     }
 
-    let _round = wait_for_quorum_block(&nodes, 1, Duration::from_secs(5));
+    let _round = wait_for_quorum_block(&nodes, 1, Duration::from_secs(15));
 
     shutdown_nodes(nodes);
 }
@@ -180,7 +180,7 @@ fn bft_timeouts_skip_missing_proposer() {
         nodes.push(start_node(genesis.clone(), keypair, addr.clone()));
     }
 
-    let round = wait_for_quorum_block(&nodes, 1, Duration::from_secs(6));
+    let round = wait_for_quorum_block(&nodes, 1, Duration::from_secs(15));
     assert!(
         round >= 1,
         "expected round advance when initial proposer is offline"

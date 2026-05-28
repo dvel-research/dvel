@@ -22,14 +22,22 @@ add_executable(sim_attack_partition executables/attacks/sim_attack_partition.cpp
 # Production executable
 add_executable(gov_ledger executables/gov_ledger.cpp)
 
+# TFT Cinematic Hardware Visualizer
+add_executable(sim_tft executables/sim_tft.cpp)
+
 # Set include directories and link libraries for all targets
 set(ALL_TARGETS
   sim_baseline sim_scenario sim_sybil sim_scheduler sim_metrics
   sim_attack_eclipse sim_attack_51percent sim_attack_sybil_flood sim_attack_partition
   gov_ledger
+  sim_tft
 )
 
 foreach(target IN LISTS ALL_TARGETS)
   target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/core")
-  target_link_libraries(${target} PRIVATE dvel_core dl pthread)
+  if(WIN32)
+    target_link_libraries(${target} PRIVATE dvel_core ws2_32 userenv ntdll bcrypt)
+  else()
+    target_link_libraries(${target} PRIVATE dvel_core dl pthread)
+  endif()
 endforeach()

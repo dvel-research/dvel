@@ -83,9 +83,15 @@ pub enum Message {
         pubkey: PublicKey,
         signature: String,
     },
-    Tx { tx: Vec<u8> },
+    Tx {
+        tx: Vec<u8>,
+    },
     Proposal(Proposal),
     Vote(SignedVote),
+    Chunk {
+        hash: Hash,
+        data: Vec<u8>,
+    },
 }
 
 #[cfg_attr(feature = "bft", derive(Serialize, Deserialize))]
@@ -131,7 +137,11 @@ pub fn merkle_root_hashes(hashes: &[Hash]) -> Hash {
         let mut i = 0;
         while i < level.len() {
             let a = level[i];
-            let b = if i + 1 < level.len() { level[i + 1] } else { level[i] };
+            let b = if i + 1 < level.len() {
+                level[i + 1]
+            } else {
+                level[i]
+            };
             let mut h = Sha256::new();
             h.update(a);
             h.update(b);

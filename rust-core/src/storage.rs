@@ -275,7 +275,9 @@ pub fn read_manifest(path: &Path) -> Result<Manifest, StorageError> {
     let cs =
         chunk_size.ok_or_else(|| StorageError::InvalidManifest("missing chunk_size".into()))?;
 
-    if let Some(n) = declared_chunks && n != chunks.len() {
+    if let Some(n) = declared_chunks
+        && n != chunks.len()
+    {
         return Err(StorageError::InvalidManifest("chunk count mismatch".into()));
     }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -lt 2 ]]; then
+if [[ $
   echo "usage: gen_tls_selfsigned.sh <output-dir> <host> [name]" >&2
   exit 2
 fi

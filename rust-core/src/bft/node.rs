@@ -2,26 +2,27 @@ use crate::bft::config::GenesisConfig;
 use crate::bft::slashing::SlashingState;
 use crate::bft::storage::{PersistedSnapshot, SnapshotStore};
 use crate::bft::types::{
-    block_hash, merkle_root_hashes, node_id_from_pubkey, proposal_bytes, tx_hash, vote_bytes,
     Block, BlockHeader, Message, NodeId, Proposal, SignedVote, ValidatorInfo, Vote, VoteType,
+    block_hash, merkle_root_hashes, node_id_from_pubkey, proposal_bytes, tx_hash, vote_bytes,
 };
 use crate::event::{Event, Hash, PublicKey, ZERO_HASH};
 use crate::ledger::Ledger;
-use crate::validation::{validate_event, ValidationContext};
+use crate::mmr::Mmr;
+use crate::validation::{ValidationContext, validate_event};
 use ed25519_dalek::{Keypair, PublicKey as DalekPublicKey, Signature, Signer, Verifier};
 use hex::{decode as hex_decode, encode as hex_encode};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rustls::server::AllowAnyAuthenticatedClient;
 use rustls::{
     Certificate, ClientConfig, ClientConnection, PrivateKey, RootCertStore, ServerConfig,
     ServerConnection, ServerName, StreamOwned,
 };
-use rustls::server::AllowAnyAuthenticatedClient;
 
 pub struct NodeConfig {
     pub listen_addr: String,
@@ -41,7 +42,9 @@ pub struct NodeSnapshot {
     pub blocks_by_height: HashMap<u64, Block>,
     pub blocks_by_hash: HashMap<Hash, Block>,
     pub tx_index: HashMap<Hash, (Hash, u64)>,
+    pub payload_index: HashMap<Hash, (Hash, u64)>,
     pub slashing_state: Option<SlashingState>,
+    pub mmr: Mmr,
 }
 
 impl NodeSnapshot {
@@ -52,8 +55,16 @@ impl NodeSnapshot {
             blocks_by_height: HashMap::new(),
             blocks_by_hash: HashMap::new(),
             tx_index: HashMap::new(),
+            payload_index: HashMap::new(),
             slashing_state: None,
+            mmr: Mmr::new(),
         }
+    }
+}
+
+impl Default for NodeSnapshot {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -69,6 +80,8 @@ struct RoundState {
     prevotes: HashMap<Hash, HashSet<NodeId>>,
     precommits: HashMap<Hash, HashSet<NodeId>>,
     proposed: bool,
+    prevoted: Option<Hash>,
+    precommitted: Option<Hash>,
 }
 
 impl RoundState {
@@ -78,6 +91,8 @@ impl RoundState {
             prevotes: HashMap::new(),
             precommits: HashMap::new(),
             proposed: false,
+            prevoted: None,
+            precommitted: None,
         }
     }
 }
@@ -85,17 +100,20 @@ impl RoundState {
 struct ValidatorSet {
     validators: Vec<ValidatorInfo>,
     by_id: HashMap<NodeId, ValidatorInfo>,
+    #[allow(dead_code)]
     quorum_power: u64,
 }
 
 impl ValidatorSet {
     fn new(validators: Vec<ValidatorInfo>) -> Self {
         let mut by_id = HashMap::new();
+        let mut total_power = 0u64;
         for v in &validators {
             by_id.insert(v.node_id, v.clone());
+            total_power = total_power.saturating_add(v.power);
         }
-        let f = (validators.len().saturating_sub(1)) / 3;
-        let quorum = ((2 * f) + 1) as u64;
+        // Quorum is strictly greater than 2/3 of total voting power: 2 * total_power / 3 + 1
+        let quorum = (2 * total_power) / 3 + 1;
         Self {
             validators,
             by_id,
@@ -103,9 +121,44 @@ impl ValidatorSet {
         }
     }
 
-    fn proposer_for(&self, height: u64, round: u64) -> &ValidatorInfo {
-        let idx = ((height + round) as usize) % self.validators.len();
-        &self.validators[idx]
+    /// Get all active (unjailed) validators at a given height
+    fn active_validators(&self, slashing_state: &SlashingState, height: u64) -> Vec<ValidatorInfo> {
+        self.validators
+            .iter()
+            .filter(|v| !slashing_state.is_jailed(&v.node_id, height))
+            .cloned()
+            .collect()
+    }
+
+    /// Get the sum of voting power of all active (unjailed) validators
+    fn active_total_power(&self, slashing_state: &SlashingState, height: u64) -> u64 {
+        self.active_validators(slashing_state, height)
+            .iter()
+            .map(|v| v.power)
+            .sum()
+    }
+
+    /// Calculate the active quorum power threshold dynamically (strictly > 2/3 of active power)
+    fn active_quorum_power(&self, slashing_state: &SlashingState, height: u64) -> u64 {
+        let total = self.active_total_power(slashing_state, height);
+        if total == 0 {
+            0
+        } else {
+            (2 * total) / 3 + 1
+        }
+    }
+
+    /// Select proposer dynamically only from the active (unjailed) validator pool
+    fn proposer_for(&self, height: u64, round: u64, slashing_state: &SlashingState) -> &ValidatorInfo {
+        let active = self.active_validators(slashing_state, height);
+        if active.is_empty() {
+            // Fallback to static selection in case of all-jailed catastrophe
+            let idx = ((height + round) as usize) % self.validators.len();
+            return &self.validators[idx];
+        }
+        let idx = ((height + round) as usize) % active.len();
+        let active_node_id = active[idx].node_id;
+        self.by_id.get(&active_node_id).unwrap()
     }
 
     fn has_validator(&self, node_id: &NodeId) -> bool {
@@ -116,20 +169,24 @@ impl ValidatorSet {
         self.by_id.get(node_id).map(|v| v.pubkey)
     }
 
-    fn quorum_met(&self, votes: &HashSet<NodeId>) -> bool {
+    /// Check if dynamic quorum is met for a set of votes at a given height
+    fn quorum_met(&self, votes: &HashSet<NodeId>, slashing_state: &SlashingState, height: u64) -> bool {
         let mut power = 0u64;
         for id in votes {
-            if let Some(v) = self.by_id.get(id) {
-                power = power.saturating_add(v.power);
+            if !slashing_state.is_jailed(id, height) {
+                if let Some(v) = self.by_id.get(id) {
+                    power = power.saturating_add(v.power);
+                }
             }
         }
-        power >= self.quorum_power
+        power >= self.active_quorum_power(slashing_state, height)
     }
 }
 
 pub enum NodeCommand {
     SubmitTx(Vec<u8>),
     Shutdown,
+    BroadcastChunk(Hash, Vec<u8>),
 }
 
 pub struct Node {
@@ -151,6 +208,9 @@ pub struct Node {
     net: Network,
     store: Option<SnapshotStore>,
     slashing_state: SlashingState,
+    future_messages: HashMap<u64, Vec<Message>>,
+    mmr: Mmr,
+    data_dir: Option<String>,
 }
 
 struct TlsConfig {
@@ -208,7 +268,6 @@ impl PeerStream {
     }
 }
 
-
 impl Node {
     pub fn new(
         genesis: GenesisConfig,
@@ -223,6 +282,7 @@ impl Node {
             return Err("node key not found in validator set".into());
         }
 
+        let data_dir = cfg.data_dir.clone();
         let store = match cfg.data_dir {
             Some(dir) => Some(SnapshotStore::new(dir)?),
             None => None,
@@ -255,6 +315,9 @@ impl Node {
             net,
             store,
             slashing_state: slashing_state.clone(),
+            future_messages: HashMap::new(),
+            mmr: Mmr::new(),
+            data_dir,
         };
 
         // Initialize slashing_state in snapshot
@@ -278,6 +341,9 @@ impl Node {
                     NodeCommand::SubmitTx(tx) => self.submit_tx(tx, true),
                     NodeCommand::Shutdown => {
                         shutdown = true;
+                    }
+                    NodeCommand::BroadcastChunk(hash, data) => {
+                        self.net.broadcast(Message::Chunk { hash, data });
                     }
                 }
             }
@@ -308,14 +374,30 @@ impl Node {
         if self.step != Step::Propose || self.round_state.proposed {
             return;
         }
-        let proposer = self.validators.proposer_for(self.height, self.round);
+        let proposer = self.validators.proposer_for(self.height, self.round, &self.slashing_state);
         if proposer.node_id != self.node_id {
             return;
         }
+
+        // If mempool is empty, enforce target_block_ms delay since the last commit
+        // to allow transactions to propagate and prevent rapid empty block generation races.
+        let mempool_empty = self.mempool.is_empty();
+        let elapsed_ms = self.round_start.elapsed().as_millis() as u64;
+        let target_ms = self.genesis.consensus.target_block_ms;
+        if mempool_empty && elapsed_ms < target_ms {
+            return;
+        }
+
         let block = self.build_block();
         let proposal = self.sign_proposal(block);
         self.round_state.proposed = true;
         self.round_state.proposal = Some(proposal.clone());
+        println!(
+            "[BFT] Node {:?} (proposer) proposing block at Height {}, Round {}",
+            hex::encode(self.node_id),
+            self.height,
+            self.round
+        );
         self.net.broadcast(Message::Proposal(proposal.clone()));
         self.handle_proposal(proposal);
     }
@@ -371,24 +453,141 @@ impl Node {
     }
 
     fn handle_message(&mut self, msg: Message) {
+        let msg_height = match &msg {
+            Message::Proposal(p) => Some(p.height),
+            Message::Vote(sv) => Some(sv.vote.height),
+            _ => None,
+        };
+
+        if let Some(h) = msg_height.filter(|&h| h > self.height) {
+            if h <= self.height + 5 {
+                println!(
+                    "[BFT] Node {:?} buffering future message for Height {} (current height {})",
+                    hex::encode(self.node_id),
+                    h,
+                    self.height
+                );
+                self.future_messages.entry(h).or_default().push(msg);
+            } else {
+                println!(
+                    "[BFT] Node {:?} dropping too-far-future message for Height {} (current height {})",
+                    hex::encode(self.node_id),
+                    h,
+                    self.height
+                );
+            }
+
+            // Trigger catch-up sync for any future height to prevent height mismatch deadlocks
+            let target = h;
+            self.catch_up_blocks(target);
+
+            return;
+        }
+
         match msg {
             Message::Tx { tx } => self.submit_tx(tx, false),
             Message::Proposal(p) => self.handle_proposal(p),
             Message::Vote(v) => self.handle_vote(v),
             Message::Hello { .. } => {}
+            Message::Chunk { hash, data } => {
+                self.save_incoming_chunk(hash, data);
+            }
+        }
+    }
+
+    fn save_incoming_chunk(&self, hash: Hash, data: Vec<u8>) {
+        use sha2::Digest;
+        let mut sha = sha2::Sha256::new();
+        sha.update(&data);
+        let computed_hash: [u8; 32] = sha.finalize().into();
+        if computed_hash != hash {
+            println!(
+                "[BFT] Node {:?} save_incoming_chunk: SHA256 hash mismatch! Ignored.",
+                hex_encode(self.node_id)
+            );
+            return;
+        }
+
+        let Some(ref dir) = self.data_dir else {
+            return;
+        };
+
+        let chunks_dir = std::path::Path::new(dir).join("chunks");
+        if let Err(e) = std::fs::create_dir_all(&chunks_dir) {
+            eprintln!("Failed to create chunks directory: {}", e);
+            return;
+        }
+
+        let chunk_path = chunks_dir.join(hex_encode(hash));
+        if chunk_path.exists() {
+            return;
+        }
+
+        if let Err(e) = std::fs::write(&chunk_path, data) {
+            eprintln!("Failed to write chunk {}: {}", hex_encode(hash), e);
+        } else {
+            println!(
+                "[BFT] Node {:?} save_incoming_chunk: Successfully saved and replicated chunk {}",
+                hex_encode(self.node_id),
+                hex_encode(hash)
+            );
         }
     }
 
     fn handle_proposal(&mut self, proposal: Proposal) {
-        if proposal.height != self.height || proposal.round != self.round {
+        println!(
+            "[BFT] Node {:?} handle_proposal: proposal from node {:?} for Height {}, Round {}",
+            hex::encode(self.node_id),
+            hex::encode(proposal.proposer_id),
+            proposal.height,
+            proposal.round
+        );
+        if proposal.height != self.height {
+            println!(
+                "[BFT] Node {:?} handle_proposal: Ignored proposal because height mismatch (proposal.height = {}, self.height = {})",
+                hex::encode(self.node_id),
+                proposal.height,
+                self.height
+            );
+            return;
+        }
+        if proposal.round < self.round {
+            println!(
+                "[BFT] Node {:?} handle_proposal: Ignored proposal because round is in the past (proposal.round = {}, self.round = {})",
+                hex::encode(self.node_id),
+                proposal.round,
+                self.round
+            );
             return;
         }
 
         if !self.verify_proposal(&proposal) {
+            println!(
+                "[BFT] Node {:?} handle_proposal: Ignored proposal because signature verification failed",
+                hex::encode(self.node_id)
+            );
             return;
         }
 
+        if proposal.round > self.round {
+            // Synchronize round to the valid future proposal
+            println!(
+                "[BFT] Node {:?} handle_proposal: Synchronizing from round {} to round {} based on valid proposal",
+                hex::encode(self.node_id),
+                self.round,
+                proposal.round
+            );
+            self.round = proposal.round;
+            self.step = Step::Propose;
+            self.round_state = RoundState::new();
+            self.round_start = Instant::now();
+        }
+
         if !self.validate_block(&proposal.block) {
+            println!(
+                "[BFT] Node {:?} handle_proposal: Block validation failed! Prevoting ZERO_HASH",
+                hex::encode(self.node_id)
+            );
             self.broadcast_vote(VoteType::Prevote, ZERO_HASH);
             self.step = Step::Prevote;
             return;
@@ -397,43 +596,97 @@ impl Node {
         self.round_state.proposal = Some(proposal.clone());
 
         let bh = block_hash(&proposal.block.header);
-        if let Some(locked) = self.locked {
-            if locked != bh {
-                self.broadcast_vote(VoteType::Prevote, ZERO_HASH);
-                self.step = Step::Prevote;
-                return;
-            }
+        if let Some(locked) = self.locked.filter(|&locked| locked != bh) {
+            println!(
+                "[BFT] Node {:?} handle_proposal: Locked block hash {:?} differs from proposal hash {:?}. Prevoting ZERO_HASH",
+                hex::encode(self.node_id),
+                hex::encode(locked),
+                hex::encode(bh)
+            );
+            self.broadcast_vote(VoteType::Prevote, ZERO_HASH);
+            self.step = Step::Prevote;
+            return;
         }
 
+        println!(
+            "[BFT] Node {:?} handle_proposal: Prevoting block hash {:?}",
+            hex::encode(self.node_id),
+            hex::encode(bh)
+        );
         self.broadcast_vote(VoteType::Prevote, bh);
         self.step = Step::Prevote;
     }
 
     fn handle_vote(&mut self, signed: SignedVote) {
+        let v = &signed.vote;
+        println!(
+            "[BFT] Node {:?} handle_vote: Received {:?} vote from validator {:?} for block {:?} at Height {}, Round {}",
+            hex::encode(self.node_id),
+            v.vote_type,
+            hex::encode(v.validator_id),
+            hex::encode(v.block_hash),
+            v.height,
+            v.round
+        );
         if !self.verify_vote(&signed) {
+            println!(
+                "[BFT] Node {:?} handle_vote: Vote verification failed",
+                hex::encode(self.node_id)
+            );
             return;
         }
-        let v = &signed.vote;
-        if v.height != self.height || v.round != self.round {
+        if v.height != self.height {
+            println!(
+                "[BFT] Node {:?} handle_vote: Ignored vote because height mismatch (vote.height = {}, self.height = {})",
+                hex::encode(self.node_id),
+                v.height,
+                self.height
+            );
             return;
+        }
+        if v.round < self.round {
+            println!(
+                "[BFT] Node {:?} handle_vote: Ignored vote because round is in the past (vote.round = {}, self.round = {})",
+                hex::encode(self.node_id),
+                v.round,
+                self.round
+            );
+            return;
+        }
+        if v.round > self.round {
+            // Synchronize round forward based on valid vote from a peer
+            println!(
+                "[BFT] Node {:?} handle_vote: Vote-sync: advancing from round {} to round {} based on peer vote",
+                hex::encode(self.node_id),
+                self.round,
+                v.round
+            );
+            self.round = v.round;
+            self.step = Step::Propose;
+            self.round_state = RoundState::new();
+            self.round_start = Instant::now();
         }
 
         // Reject votes from jailed validators
         if self.slashing_state.is_jailed(&v.validator_id, self.height) {
+            println!(
+                "[BFT] Node {:?} handle_vote: Validator {:?} is jailed, ignoring vote",
+                hex::encode(self.node_id),
+                hex::encode(v.validator_id)
+            );
             return;
         }
 
         // Check for double-signing and apply slashing if detected
-        if let Some(evidence) = self.slashing_state.record_vote(
-            &signed,
-            &self.genesis.consensus.slashing,
-            self.height,
-        ) {
+        if let Some(evidence) =
+            self.slashing_state
+                .record_vote(&signed, &self.genesis.consensus.slashing, self.height)
+        {
             eprintln!(
                 "SLASHING DETECTED: Double-sign by validator {:?} at height {} round {}",
                 v.validator_id, v.height, v.round
             );
-            
+
             match self.slashing_state.slash(
                 evidence.clone(),
                 &self.genesis.consensus.slashing,
@@ -463,12 +716,52 @@ impl Node {
         let entry = vote_set.entry(v.block_hash).or_insert_with(HashSet::new);
         entry.insert(v.validator_id);
 
-        if self.validators.quorum_met(entry) {
+        let total_voted_power = {
+            let mut power = 0u64;
+            for id in entry.iter() {
+                if !self.slashing_state.is_jailed(id, self.height) {
+                    if let Some(val) = self.validators.by_id.get(id) {
+                        power += val.power;
+                    }
+                }
+            }
+            power
+        };
+
+        let active_quorum = self.validators.active_quorum_power(&self.slashing_state, self.height);
+        println!(
+            "[BFT] Node {:?} handle_vote: {:?} block {:?} now has {}/{} power",
+            hex::encode(self.node_id),
+            v.vote_type,
+            hex::encode(v.block_hash),
+            total_voted_power,
+            active_quorum
+        );
+
+        if self.validators.quorum_met(entry, &self.slashing_state, self.height) {
+            println!(
+                "[BFT] Node {:?} handle_vote: quorum met for {:?} block {:?}",
+                hex::encode(self.node_id),
+                v.vote_type,
+                hex::encode(v.block_hash)
+            );
             match v.vote_type {
                 VoteType::Prevote => {
                     if v.block_hash != ZERO_HASH {
                         self.locked = Some(v.block_hash);
+                        println!(
+                            "[BFT] Node {:?} handle_vote: Prevote quorum met. Locking block {:?}, broadcasting Precommit",
+                            hex::encode(self.node_id),
+                            hex::encode(v.block_hash)
+                        );
                         self.broadcast_vote(VoteType::Precommit, v.block_hash);
+                        self.step = Step::Precommit;
+                    } else {
+                        println!(
+                            "[BFT] Node {:?} handle_vote: Prevote quorum met for ZERO_HASH. Broadcasting Precommit for ZERO_HASH",
+                            hex::encode(self.node_id)
+                        );
+                        self.broadcast_vote(VoteType::Precommit, ZERO_HASH);
                         self.step = Step::Precommit;
                     }
                 }
@@ -477,12 +770,34 @@ impl Node {
                         if let Some(block) = self.round_state.proposal.clone().map(|p| p.block) {
                             let bh = block_hash(&block.header);
                             if bh == v.block_hash {
+                                println!(
+                                    "[BFT] Node {:?} handle_vote: Precommit quorum met. Committing block at Height {}",
+                                    hex::encode(self.node_id),
+                                    block.header.height
+                                );
                                 if let Err(e) = self.commit_block(block) {
                                     eprintln!("fatal: commit failed: {}", e);
                                     std::process::exit(1);
                                 }
+                            } else {
+                                println!(
+                                    "[BFT] Node {:?} handle_vote: Precommit quorum met for block {:?}, but proposal block hash is {:?}",
+                                    hex::encode(self.node_id),
+                                    hex::encode(v.block_hash),
+                                    hex::encode(bh)
+                                );
                             }
+                        } else {
+                            println!(
+                                "[BFT] Node {:?} handle_vote: Precommit quorum met, but no proposal block found in round_state!",
+                                hex::encode(self.node_id)
+                            );
                         }
+                    } else {
+                        println!(
+                            "[BFT] Node {:?} handle_vote: Precommit quorum met for ZERO_HASH. We will wait for check_timeouts to advance the round.",
+                            hex::encode(self.node_id)
+                        );
                     }
                 }
             }
@@ -495,14 +810,24 @@ impl Node {
 
         let mut persisted: Option<PersistedSnapshot> = None;
         {
-            let mut snap = self.snapshot.write().map_err(|_| "snapshot lock".to_string())?;
+            let mut snap = self
+                .snapshot
+                .write()
+                .map_err(|_| "snapshot lock".to_string())?;
             snap.height = block.header.height;
             snap.tip_hash = bh;
-            snap.blocks_by_height.insert(block.header.height, block.clone());
+            snap.blocks_by_height
+                .insert(block.header.height, block.clone());
             snap.blocks_by_hash.insert(bh, block.clone());
             for tx in &block.txs {
                 let th = tx_hash(tx);
                 snap.tx_index.insert(th, (bh, block.header.height));
+                if let Ok(ev) = decode_event(tx) {
+                    snap.payload_index
+                        .insert(ev.payload_hash, (bh, block.header.height));
+                    self.mmr.append(ev.payload_hash);
+                    snap.mmr.append(ev.payload_hash);
+                }
             }
             if self.store.is_some() {
                 persisted = Some(snapshot_to_persisted(&snap));
@@ -517,10 +842,25 @@ impl Node {
         self.round_state = RoundState::new();
         self.prune_mempool(&block.txs);
         if let (Some(store), Some(persisted)) = (&self.store, persisted) {
-            if let Err(e) = store.save(&persisted) {
+            let _ = store.save(&persisted).map_err(|e| {
                 eprintln!("snapshot save failed: {}", e);
+            });
+        }
+
+        // Retrieve and process any buffered future messages for the new height
+        let new_height = self.height;
+        if let Some(buffered_msgs) = self.future_messages.remove(&new_height) {
+            println!(
+                "[BFT] Node {:?} processing {} buffered messages for the new Height {}",
+                hex::encode(self.node_id),
+                buffered_msgs.len(),
+                new_height
+            );
+            for msg in buffered_msgs {
+                self.handle_message(msg);
             }
         }
+
         Ok(())
     }
 
@@ -528,8 +868,7 @@ impl Node {
         if committed.is_empty() {
             return;
         }
-        let committed_hashes: HashSet<Hash> =
-            committed.iter().map(|t| tx_hash(t)).collect();
+        let committed_hashes: HashSet<Hash> = committed.iter().map(|t| tx_hash(t)).collect();
         let mut new_pool = VecDeque::new();
         let mut bytes = 0usize;
         while let Some(tx) = self.mempool.pop_front() {
@@ -542,6 +881,104 @@ impl Node {
         self.mempool_bytes = bytes;
     }
 
+    fn fetch_block_from_peer(&self, peer_gossip_addr: &str, height: u64) -> Option<Block> {
+        let parts: Vec<&str> = peer_gossip_addr.split(':').collect();
+        if parts.len() != 2 {
+            return None;
+        }
+        let ip = parts[0];
+        let gossip_port: u16 = parts[1].parse().ok()?;
+        let client_port = gossip_port.checked_sub(2000)?;
+        let client_addr = format!("{}:{}", ip, client_port);
+
+        let mut stream =
+            TcpStream::connect_timeout(&client_addr.parse().ok()?, Duration::from_millis(500))
+                .ok()?;
+
+        let request = format!(
+            "GET /rawblock/{} HTTP/1.0\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            height, client_addr
+        );
+        stream.write_all(request.as_bytes()).ok()?;
+        stream.flush().ok()?;
+
+        let mut response = Vec::new();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(1000)))
+            .ok()?;
+        stream.read_to_end(&mut response).ok()?;
+
+        let body_offset = response.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+        let body = &response[body_offset..];
+
+        serde_json::from_slice::<Block>(body).ok()
+    }
+
+    fn catch_up_blocks(&mut self, target_height: u64) {
+        println!(
+            "[BFT] Node {:?} detecting lag (current height {}, target height {}). Initiating block catch-up sync...",
+            hex::encode(self.node_id),
+            self.height,
+            target_height
+        );
+        let peers: Vec<String> = self
+            .genesis
+            .validators
+            .iter()
+            .map(|v| v.address.clone())
+            .collect();
+        if peers.is_empty() {
+            return;
+        }
+
+        let mut current_sync_height = self.height;
+        while current_sync_height < target_height {
+            let mut block_fetched = false;
+            for peer_addr in &peers {
+                if let Some(val) = self
+                    .genesis
+                    .validators
+                    .iter()
+                    .find(|v| v.address == *peer_addr)
+                {
+                    let our_pubkey_hex = hex::encode(self.keypair.public.to_bytes());
+                    if val.pubkey_hex == our_pubkey_hex {
+                        continue;
+                    }
+                }
+
+                if let Some(block) = self.fetch_block_from_peer(peer_addr, current_sync_height) {
+                    println!(
+                        "[BFT] Node {:?} successfully fetched Block {} from peer {}",
+                        hex::encode(self.node_id),
+                        current_sync_height,
+                        peer_addr
+                    );
+                    if let Err(e) = self.commit_block(block) {
+                        eprintln!(
+                            "[BFT] Node {:?} failed to commit fetched Block {}: {}",
+                            hex::encode(self.node_id),
+                            current_sync_height,
+                            e
+                        );
+                        break;
+                    }
+                    current_sync_height = self.height;
+                    block_fetched = true;
+                    break;
+                }
+            }
+            if !block_fetched {
+                eprintln!(
+                    "[BFT] Node {:?} could not fetch Block {} from any peer. Pausing catch-up sync.",
+                    hex::encode(self.node_id),
+                    current_sync_height
+                );
+                break;
+            }
+        }
+    }
+
     fn apply_block(&mut self, block: &Block) -> Result<(), String> {
         // 0.1.2 Parallel validation (no state mutation)
         #[cfg(feature = "parallel")]
@@ -549,39 +986,49 @@ impl Node {
             use rayon::prelude::*;
             let vctx = self.vctx_by_author.clone();
             let known = self.ledger.hashes_set();
-            
-            // Parallel: decode and validate all events
-            let results: Result<Vec<_>, String> = block.txs.par_iter()
+
+            // Parallel: decode and validate all events (signatures & timestamps per author context)
+            let results: Result<Vec<_>, String> = block
+                .txs
+                .par_iter()
                 .map(|tx| {
                     let ev = decode_event(tx)?;
-                    let mut ctx = vctx.get(&ev.author).cloned().unwrap_or_else(ValidationContext::new);
+                    let mut ctx = vctx
+                        .get(&ev.author)
+                        .cloned()
+                        .unwrap_or_else(ValidationContext::new);
                     validate_event(&ev, &mut ctx).map_err(|e| format!("{:?}", e))?;
-                    
                     let h = Ledger::hash_event(&ev);
-                    if known.contains(&h) {
-                        return Err("duplicate event hash in block".into());
-                    }
-                    if ev.prev_hash != ZERO_HASH && !known.contains(&ev.prev_hash) {
-                        return Err("missing parent in block".into());
-                    }
                     Ok((ev, h))
                 })
                 .collect();
-            
+
             let validated = results?;
-            
+
             // 0.1.2 Single-threaded application (deterministic order)
-            // Skip re-validation since 0.1.1 already verified signatures
-            for (ev, _h) in validated {
+            // Skip re-signature-validation, but perform linkage and duplicate checks sequentially
+            // to support transactions depending on other transactions within the same block.
+            let mut known_mut = known;
+            for (ev, h) in validated {
+                if known_mut.contains(&h) {
+                    return Err("duplicate event hash in block".into());
+                }
+                if ev.prev_hash != ZERO_HASH && !known_mut.contains(&ev.prev_hash) {
+                    return Err("missing parent in block".into());
+                }
+                known_mut.insert(h);
+
                 // Only update timestamp context without re-validating signature
-                let ctx = self.vctx_by_author.entry(ev.author).or_insert_with(ValidationContext::new);
+                let ctx = self.vctx_by_author.entry(ev.author).or_default();
                 if ev.timestamp > ctx.last_timestamp {
                     ctx.last_timestamp = ev.timestamp;
                 }
-                self.ledger.try_add_event(ev).map_err(|e| format!("{:?}", e))?;
+                self.ledger
+                    .try_add_event(ev)
+                    .map_err(|e| format!("{:?}", e))?;
             }
         }
-        
+
         #[cfg(not(feature = "parallel"))]
         {
             // Original single-threaded path
@@ -648,7 +1095,9 @@ impl Node {
     }
 
     fn verify_proposal(&self, proposal: &Proposal) -> bool {
-        let proposer = self.validators.proposer_for(proposal.height, proposal.round);
+        let proposer = self
+            .validators
+            .proposer_for(proposal.height, proposal.round, &self.slashing_state);
         if proposer.node_id != proposal.proposer_id {
             return false;
         }
@@ -678,6 +1127,39 @@ impl Node {
     }
 
     fn broadcast_vote(&mut self, vote_type: VoteType, block_hash: Hash) {
+        println!(
+            "[BFT] Node {:?} broadcast_vote: Broadcasting {:?} vote for block hash {:?}",
+            hex::encode(self.node_id),
+            vote_type,
+            hex::encode(block_hash)
+        );
+        match vote_type {
+            VoteType::Prevote => {
+                if let Some(existing) = self.round_state.prevoted {
+                    if existing != block_hash {
+                        eprintln!(
+                            "WARNING: node attempted to double-prevote in height {} round {} (existing: {:?}, new: {:?})",
+                            self.height, self.round, existing, block_hash
+                        );
+                    }
+                    return;
+                }
+                self.round_state.prevoted = Some(block_hash);
+            }
+            VoteType::Precommit => {
+                if let Some(existing) = self.round_state.precommitted {
+                    if existing != block_hash {
+                        eprintln!(
+                            "WARNING: node attempted to double-precommit in height {} round {} (existing: {:?}, new: {:?})",
+                            self.height, self.round, existing, block_hash
+                        );
+                    }
+                    return;
+                }
+                self.round_state.precommitted = Some(block_hash);
+            }
+        }
+
         let vote = Vote {
             height: self.height,
             round: self.round,
@@ -705,21 +1187,53 @@ impl Node {
 
         let backoff = timeout_backoff(base, cfg, self.round);
         if elapsed > backoff {
+            println!(
+                "[BFT] Node {:?} check_timeouts: Timeout in Step::{:?} at Height {}, Round {} after {}ms (backoff limit = {}ms)",
+                hex::encode(self.node_id),
+                self.step,
+                self.height,
+                self.round,
+                elapsed.as_millis(),
+                backoff.as_millis()
+            );
             match self.step {
                 Step::Propose => {
                     if self.round_state.proposal.is_none() {
+                        println!(
+                            "[BFT] Node {:?} check_timeouts: No proposal received in Step::Propose, prevoting ZERO_HASH",
+                            hex::encode(self.node_id)
+                        );
                         self.broadcast_vote(VoteType::Prevote, ZERO_HASH);
                     }
                     self.step = Step::Prevote;
                     self.round_start = Instant::now();
                 }
                 Step::Prevote => {
+                    println!(
+                        "[BFT] Node {:?} check_timeouts: Prevote timeout expired, precommitting ZERO_HASH",
+                        hex::encode(self.node_id)
+                    );
                     self.broadcast_vote(VoteType::Precommit, ZERO_HASH);
                     self.step = Step::Precommit;
                     self.round_start = Instant::now();
                 }
                 Step::Precommit => {
-                    self.round = self.round.saturating_add(1);
+                    let next_round = self.round.saturating_add(1);
+                    println!(
+                        "[BFT] Node {:?} check_timeouts: Precommit timeout expired, advancing from round {} to round {}",
+                        hex::encode(self.node_id),
+                        self.round,
+                        next_round
+                    );
+                    self.round = next_round;
+                    if next_round >= 2 && self.locked.is_some() {
+                        println!(
+                            "[BFT] Node {:?} check_timeouts: Round deadlock detected at Round {}. Unlocking block hash to restore liveness.",
+                            hex::encode(self.node_id),
+                            next_round
+                        );
+                        self.locked = None;
+                    }
                     self.step = Step::Propose;
                     self.round_state = RoundState::new();
                     self.round_start = Instant::now();
@@ -745,6 +1259,7 @@ impl Node {
         let mut snap = NodeSnapshot::new();
         let mut expected_prev = ZERO_HASH;
         let mut expected_height = 1u64;
+        let mut mmr = Mmr::new();
         for block in &blocks {
             if block.header.height != expected_height {
                 return Err("snapshot block height mismatch".into());
@@ -754,11 +1269,17 @@ impl Node {
             }
             self.apply_block(block)?;
             let bh = block_hash(&block.header);
-            snap.blocks_by_height.insert(block.header.height, block.clone());
+            snap.blocks_by_height
+                .insert(block.header.height, block.clone());
             snap.blocks_by_hash.insert(bh, block.clone());
             for tx in &block.txs {
                 let th = tx_hash(tx);
                 snap.tx_index.insert(th, (bh, block.header.height));
+                if let Ok(ev) = decode_event(tx) {
+                    snap.payload_index
+                        .insert(ev.payload_hash, (bh, block.header.height));
+                    mmr.append(ev.payload_hash);
+                }
             }
             expected_prev = bh;
             expected_height = expected_height.saturating_add(1);
@@ -774,6 +1295,9 @@ impl Node {
             snap.height = persisted.height;
             snap.tip_hash = persisted.tip_hash;
         }
+
+        snap.mmr = mmr.clone();
+        self.mmr = mmr;
 
         // Restore slashing state from persisted snapshot
         snap.slashing_state = persisted.slashing_state.clone();
@@ -840,26 +1364,46 @@ impl Network {
         thread::spawn(move || {
             use std::io::ErrorKind;
             let listener = TcpListener::bind(listen_addr).expect("bind listen");
-            listener
-                .set_nonblocking(true)
-                .expect("set nonblocking");
+            listener.set_nonblocking(true).expect("set nonblocking");
             loop {
                 if shutdown_in.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        if let Err(e) = stream.set_nonblocking(false) {
+                            eprintln!("Listener: failed to set blocking on accepted stream: {}", e);
+                            continue;
+                        }
+                        if let Err(e) = stream.set_read_timeout(Some(Duration::from_secs(5))) {
+                            eprintln!(
+                                "Listener: failed to set read timeout on accepted stream: {}",
+                                e
+                            );
+                            continue;
+                        }
                         let mut peer_stream = match make_server_stream(stream, tls_in.as_deref()) {
                             Ok(s) => s,
-                            Err(_) => continue,
+                            Err(e) => {
+                                eprintln!("Listener: failed to establish server TLS stream: {}", e);
+                                continue;
+                            }
                         };
                         if let Some(peer_id) =
                             handshake_accept(&mut peer_stream, &allowlist_clone, &kp_clone)
                         {
                             peer_stream.set_read_timeout(Duration::from_millis(50));
-                            let sender = spawn_peer(peer_stream, tx_net_in.clone(), Arc::clone(&shutdown_in));
+                            let sender = spawn_peer(
+                                peer_id,
+                                Arc::clone(&peers_clone),
+                                peer_stream,
+                                tx_net_in.clone(),
+                                Arc::clone(&shutdown_in),
+                            );
                             let mut map = peers_clone.lock().unwrap();
                             map.insert(peer_id, sender);
+                        } else {
+                            eprintln!("Listener: handshake failed from incoming connection");
                         }
                     }
                     Err(err) if err.kind() == ErrorKind::WouldBlock => {
@@ -887,38 +1431,63 @@ impl Network {
                 continue;
             }
             let addr = v.address.clone();
+            let peer_node_id = v.node_id;
             let allowlist = self.allowlist.clone();
             let peers = Arc::clone(&self.peers);
             let kp = Arc::clone(&self.keypair);
             let tx_net = self.tx_net.clone();
             let shutdown = Arc::clone(&self.shutdown);
             let tls = self.tls.clone();
-            thread::spawn(move || loop {
-                if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                    break;
-                }
-                let mut peer_stream = match make_client_stream(&addr, tls.as_deref()) {
-                    Ok(s) => s,
-                    Err(_) => {
-                        thread::sleep(Duration::from_millis(500));
-                        continue;
+            thread::spawn(move || {
+                loop {
+                    if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
                     }
-                };
-                if let Some(peer_id) = handshake_connect(&mut peer_stream, &allowlist, &kp) {
-                    peer_stream.set_read_timeout(Duration::from_millis(50));
-                    let sender = spawn_peer(peer_stream, tx_net.clone(), Arc::clone(&shutdown));
-                    let mut map = peers.lock().unwrap();
-                    map.insert(peer_id, sender);
-                    break;
+                    // Check if peer is already connected
+                    {
+                        if let Some(map) = peers
+                            .lock()
+                            .ok()
+                            .filter(|map| map.contains_key(&peer_node_id))
+                        {
+                            drop(map);
+                            thread::sleep(Duration::from_millis(1000));
+                            continue;
+                        }
+                    }
+                    let mut peer_stream = match make_client_stream(&addr, tls.as_deref()) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("Peer connect: make_client_stream failed to {}: {}", addr, e);
+                            thread::sleep(Duration::from_millis(2000));
+                            continue;
+                        }
+                    };
+                    if let Some(peer_id) = handshake_connect(&mut peer_stream, &allowlist, &kp) {
+                        peer_stream.set_read_timeout(Duration::from_millis(50));
+                        let sender = spawn_peer(
+                            peer_id,
+                            Arc::clone(&peers),
+                            peer_stream,
+                            tx_net.clone(),
+                            Arc::clone(&shutdown),
+                        );
+                        if let Ok(mut map) = peers.lock() {
+                            map.insert(peer_id, sender);
+                        }
+                        eprintln!("Peer connect: successfully connected to peer at {}", addr);
+                    } else {
+                        eprintln!("Peer connect: handshake failed with peer at {}", addr);
+                    }
+                    thread::sleep(Duration::from_millis(2000));
                 }
-                thread::sleep(Duration::from_millis(500));
             });
         }
     }
 
     pub fn broadcast(&self, msg: Message) {
         let peers = self.peers.lock().unwrap();
-        for (_, peer) in peers.iter() {
+        for peer in peers.values() {
             let _ = peer.send(msg.clone());
         }
     }
@@ -932,12 +1501,35 @@ impl Network {
 }
 
 fn spawn_peer(
+    peer_id: NodeId,
+    peers: Arc<Mutex<HashMap<NodeId, mpsc::Sender<Message>>>>,
     mut stream: PeerStream,
     tx_net: mpsc::Sender<Message>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) -> mpsc::Sender<Message> {
     let (tx_out, rx_out) = mpsc::channel();
+    let peers_clone = Arc::clone(&peers);
     thread::spawn(move || {
+        struct CleanupGuard {
+            peer_id: NodeId,
+            peers: Arc<Mutex<HashMap<NodeId, mpsc::Sender<Message>>>>,
+        }
+        impl Drop for CleanupGuard {
+            fn drop(&mut self) {
+                if let Ok(mut map) = self.peers.lock() {
+                    map.remove(&self.peer_id);
+                    println!(
+                        "[BFT] Connection dropped for peer {:?}",
+                        hex::encode(self.peer_id)
+                    );
+                }
+            }
+        }
+        let _guard = CleanupGuard {
+            peer_id,
+            peers: peers_clone,
+        };
+
         let mut buf = Vec::new();
         loop {
             if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
@@ -957,16 +1549,14 @@ fn spawn_peer(
             }
 
             match read_into_buffer(&mut stream, &mut buf) {
-                Ok(()) => {
-                    loop {
-                        let msg = match try_decode_message(&mut buf) {
-                            Ok(Some(msg)) => msg,
-                            Ok(None) => break,
-                            Err(_) => return,
-                        };
-                        let _ = tx_net.send(msg);
-                    }
-                }
+                Ok(()) => loop {
+                    let msg = match try_decode_message(&mut buf) {
+                        Ok(Some(msg)) => msg,
+                        Ok(None) => break,
+                        Err(_) => return,
+                    };
+                    let _ = tx_net.send(msg);
+                },
                 Err(_) => return,
             }
 
@@ -984,7 +1574,12 @@ fn read_into_buffer(stream: &mut PeerStream, buf: &mut Vec<u8>) -> Result<(), St
             buf.extend_from_slice(&tmp[..n]);
             Ok(())
         }
-        Err(err) if matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
             Ok(())
         }
         Err(err) => Err(format!("{}", err)),
@@ -1008,7 +1603,10 @@ fn try_decode_message(buf: &mut Vec<u8>) -> Result<Option<Message>, String> {
     Ok(Some(msg))
 }
 
-fn build_tls_config(identity: TlsIdentity, validators: &[ValidatorInfo]) -> Result<TlsConfig, String> {
+fn build_tls_config(
+    identity: TlsIdentity,
+    validators: &[ValidatorInfo],
+) -> Result<TlsConfig, String> {
     let mut roots = RootCertStore::empty();
     for v in validators {
         let cert = v
@@ -1040,8 +1638,10 @@ fn build_tls_config(identity: TlsIdentity, validators: &[ValidatorInfo]) -> Resu
 
 fn make_server_stream(stream: TcpStream, tls: Option<&TlsConfig>) -> Result<PeerStream, String> {
     if let Some(tls) = tls {
-        let conn = ServerConnection::new(Arc::clone(&tls.server))
-            .map_err(|_| "tls server config error".to_string())?;
+        let conn = ServerConnection::new(Arc::clone(&tls.server)).map_err(|e| {
+            eprintln!("make_server_stream: ServerConnection::new error: {:?}", e);
+            format!("{:?}", e)
+        })?;
         Ok(PeerStream::TlsServer(StreamOwned::new(conn, stream)))
     } else {
         Ok(PeerStream::Plain(stream))
@@ -1049,11 +1649,22 @@ fn make_server_stream(stream: TcpStream, tls: Option<&TlsConfig>) -> Result<Peer
 }
 
 fn make_client_stream(addr: &str, tls: Option<&TlsConfig>) -> Result<PeerStream, String> {
-    let stream = TcpStream::connect(addr).map_err(|e| format!("{}", e))?;
+    let stream = TcpStream::connect(addr).map_err(|e| {
+        eprintln!("make_client_stream: tcp connect to {} failed: {}", addr, e);
+        format!("{}", e)
+    })?;
     if let Some(tls) = tls {
-        let server_name = server_name_from_addr(addr)?;
-        let conn = ClientConnection::new(Arc::clone(&tls.client), server_name)
-            .map_err(|_| "tls client config error".to_string())?;
+        let server_name = server_name_from_addr(addr).map_err(|e| {
+            eprintln!("make_client_stream: server_name_from_addr failed: {}", e);
+            e.clone()
+        })?;
+        let conn = ClientConnection::new(Arc::clone(&tls.client), server_name).map_err(|e| {
+            eprintln!(
+                "make_client_stream: ClientConnection::new error for host {}: {:?}",
+                addr, e
+            );
+            format!("{:?}", e)
+        })?;
         Ok(PeerStream::TlsClient(StreamOwned::new(conn, stream)))
     } else {
         Ok(PeerStream::Plain(stream))
@@ -1078,34 +1689,78 @@ fn handshake_accept<S: Read + Write>(
     allowlist: &HashMap<NodeId, PublicKey>,
     keypair: &Arc<Keypair>,
 ) -> Option<NodeId> {
-    let hello = read_message(stream).ok()??;
+    let hello = match read_message(stream) {
+        Ok(Some(msg)) => msg,
+        Ok(None) => {
+            eprintln!("handshake_accept: no message received");
+            return None;
+        }
+        Err(e) => {
+            eprintln!("handshake_accept: read error: {}", e);
+            return None;
+        }
+    };
     let Message::Hello {
         node_id,
         pubkey,
         signature,
-    } = hello else {
+    } = hello
+    else {
+        eprintln!("handshake_accept: message is not Hello");
         return None;
     };
-    let expected = allowlist.get(&node_id)?;
+    let expected = match allowlist.get(&node_id) {
+        Some(pk) => pk,
+        None => {
+            eprintln!(
+                "handshake_accept: node_id {} not in allowlist",
+                hex::encode(node_id)
+            );
+            return None;
+        }
+    };
     if expected != &pubkey {
+        eprintln!(
+            "handshake_accept: pubkey mismatch for node_id {}",
+            hex::encode(node_id)
+        );
         return None;
     }
-    let pk = DalekPublicKey::from_bytes(&pubkey).ok()?;
-    let sig = sig_from_hex(&signature)?;
-    let hello = hello_bytes(&node_id);
-    if pk.verify(&hello, &sig).is_err() {
+    let pk = match DalekPublicKey::from_bytes(&pubkey).ok() {
+        Some(pk) => pk,
+        None => {
+            eprintln!(
+                "handshake_accept: invalid pubkey bytes for node_id {}",
+                hex::encode(node_id)
+            );
+            return None;
+        }
+    };
+    let sig = match sig_from_hex(&signature) {
+        Some(sig) => sig,
+        None => {
+            eprintln!("handshake_accept: invalid signature hex");
+            return None;
+        }
+    };
+    let hello_bytes_data = hello_bytes(&node_id);
+    if let Err(e) = pk.verify(&hello_bytes_data, &sig) {
+        eprintln!("handshake_accept: signature verification failed: {:?}", e);
         return None;
     }
 
     let my_id = node_id_from_pubkey(&keypair.public.to_bytes());
-    let hello = hello_bytes(&my_id);
-    let my_sig = keypair.sign(&hello);
+    let hello_bytes_data = hello_bytes(&my_id);
+    let my_sig = keypair.sign(&hello_bytes_data);
     let response = Message::Hello {
         node_id: my_id,
         pubkey: keypair.public.to_bytes(),
         signature: sig_to_hex(&my_sig),
     };
-    let _ = write_message(stream, &response);
+    if let Err(e) = write_message(stream, &response) {
+        eprintln!("handshake_accept: failed to write response Hello: {}", e);
+        return None;
+    }
     Some(node_id)
 }
 
@@ -1115,30 +1770,74 @@ fn handshake_connect<S: Read + Write>(
     keypair: &Arc<Keypair>,
 ) -> Option<NodeId> {
     let my_id = node_id_from_pubkey(&keypair.public.to_bytes());
-    let hello = hello_bytes(&my_id);
-    let sig = keypair.sign(&hello);
+    let hello_bytes_data = hello_bytes(&my_id);
+    let sig = keypair.sign(&hello_bytes_data);
     let hello = Message::Hello {
         node_id: my_id,
         pubkey: keypair.public.to_bytes(),
         signature: sig_to_hex(&sig),
     };
-    let _ = write_message(stream, &hello);
-    let reply = read_message(stream).ok()??;
+    if let Err(e) = write_message(stream, &hello) {
+        eprintln!("handshake_connect: failed to write Hello message: {}", e);
+        return None;
+    }
+    let reply = match read_message(stream) {
+        Ok(Some(msg)) => msg,
+        Ok(None) => {
+            eprintln!("handshake_connect: no reply received");
+            return None;
+        }
+        Err(e) => {
+            eprintln!("handshake_connect: read reply error: {}", e);
+            return None;
+        }
+    };
     let Message::Hello {
         node_id,
         pubkey,
         signature,
-    } = reply else {
+    } = reply
+    else {
+        eprintln!("handshake_connect: reply is not Hello message");
         return None;
     };
-    let expected = allowlist.get(&node_id)?;
+    let expected = match allowlist.get(&node_id) {
+        Some(pk) => pk,
+        None => {
+            eprintln!(
+                "handshake_connect: node_id {} not in allowlist",
+                hex::encode(node_id)
+            );
+            return None;
+        }
+    };
     if expected != &pubkey {
+        eprintln!(
+            "handshake_connect: pubkey mismatch for node_id {}",
+            hex::encode(node_id)
+        );
         return None;
     }
-    let pk = DalekPublicKey::from_bytes(&pubkey).ok()?;
-    let sig = sig_from_hex(&signature)?;
-    let hello = hello_bytes(&node_id);
-    if pk.verify(&hello, &sig).is_err() {
+    let pk = match DalekPublicKey::from_bytes(&pubkey).ok() {
+        Some(pk) => pk,
+        None => {
+            eprintln!(
+                "handshake_connect: invalid pubkey bytes for node_id {}",
+                hex::encode(node_id)
+            );
+            return None;
+        }
+    };
+    let sig = match sig_from_hex(&signature) {
+        Some(sig) => sig,
+        None => {
+            eprintln!("handshake_connect: invalid signature hex");
+            return None;
+        }
+    };
+    let hello_bytes_data = hello_bytes(&node_id);
+    if let Err(e) = pk.verify(&hello_bytes_data, &sig) {
+        eprintln!("handshake_connect: signature verification failed: {:?}", e);
         return None;
     }
     Some(node_id)
@@ -1188,9 +1887,7 @@ fn write_message<W: Write>(stream: &mut W, msg: &Message) -> Result<(), String> 
     stream
         .write_all(&len.to_le_bytes())
         .map_err(|e| format!("{}", e))?;
-    stream
-        .write_all(&data)
-        .map_err(|e| format!("{}", e))?;
+    stream.write_all(&data).map_err(|e| format!("{}", e))?;
     Ok(())
 }
 
@@ -1208,14 +1905,12 @@ fn read_message<R: Read>(stream: &mut R) -> Result<Option<Message>, String> {
         return Err("invalid message length".into());
     }
     let mut data = vec![0u8; len];
-    stream
-        .read_exact(&mut data)
-        .map_err(|e| format!("{}", e))?;
+    stream.read_exact(&mut data).map_err(|e| format!("{}", e))?;
     let msg = serde_json::from_slice(&data).map_err(|e| format!("{}", e))?;
     Ok(Some(msg))
 }
 
-fn decode_event(tx: &[u8]) -> Result<Event, String> {
+pub fn decode_event(tx: &[u8]) -> Result<Event, String> {
     if tx.len() != 1 + 32 + 32 + 8 + 32 + 64 {
         return Err("invalid tx length".into());
     }
@@ -1286,4 +1981,115 @@ fn timeout_backoff(
     }
     let capped = base.min(cfg.timeout_cap_ms as u128);
     Duration::from_millis(capped as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn test_dynamic_validator_set_quorum() {
+        let node_0: NodeId = [0; 32];
+        let node_1: NodeId = [1; 32];
+        let node_2: NodeId = [2; 32];
+        let node_3: NodeId = [3; 32];
+
+        let vals = vec![
+            ValidatorInfo {
+                pubkey: [0; 32],
+                node_id: node_0,
+                address: "127.0.0.1:9000".to_string(),
+                power: 10,
+                stake: 1_000_000,
+                tls_cert: None,
+            },
+            ValidatorInfo {
+                pubkey: [1; 32],
+                node_id: node_1,
+                address: "127.0.0.1:9001".to_string(),
+                power: 10,
+                stake: 1_000_000,
+                tls_cert: None,
+            },
+            ValidatorInfo {
+                pubkey: [2; 32],
+                node_id: node_2,
+                address: "127.0.0.1:9002".to_string(),
+                power: 10,
+                stake: 1_000_000,
+                tls_cert: None,
+            },
+            ValidatorInfo {
+                pubkey: [3; 32],
+                node_id: node_3,
+                address: "127.0.0.1:9003".to_string(),
+                power: 10,
+                stake: 1_000_000,
+                tls_cert: None,
+            },
+        ];
+
+        let val_set = ValidatorSet::new(vals);
+
+        // Initial SlashingState (no one is jailed)
+        let mut stakes = HashMap::new();
+        for id in &[node_0, node_1, node_2, node_3] {
+            stakes.insert(*id, 1_000_000);
+        }
+        let mut slashing = SlashingState::new(stakes);
+
+        // Scenario 1: Clean network (no jailed nodes)
+        // Total power = 40. Quorum is 2 * 40 / 3 + 1 = 27.
+        assert_eq!(val_set.active_total_power(&slashing, 1), 40);
+        assert_eq!(val_set.active_quorum_power(&slashing, 1), 27);
+        
+        let mut votes = HashSet::new();
+        votes.insert(node_0);
+        votes.insert(node_1);
+        assert!(!val_set.quorum_met(&votes, &slashing, 1), "20/40 power should not meet quorum");
+        
+        votes.insert(node_2);
+        assert!(val_set.quorum_met(&votes, &slashing, 1), "30/40 power should meet quorum");
+
+        // Scenario 2: 1 Validator is jailed (Node 3)
+        // Total active power = 30. Quorum is 2 * 30 / 3 + 1 = 21.
+        slashing.jailed.insert(node_3, 100);
+        assert_eq!(val_set.active_total_power(&slashing, 1), 30);
+        assert_eq!(val_set.active_quorum_power(&slashing, 1), 21);
+        
+        let mut votes_jailed = HashSet::new();
+        votes_jailed.insert(node_0);
+        votes_jailed.insert(node_1);
+        assert!(!val_set.quorum_met(&votes_jailed, &slashing, 1), "20/30 power should not meet quorum");
+        
+        votes_jailed.insert(node_2);
+        assert!(val_set.quorum_met(&votes_jailed, &slashing, 1), "30/30 power should meet quorum");
+
+        // Verify proposer round-robin skips jailed node_3
+        // Active set: node_0, node_1, node_2.
+        // Height 1 + Round 0 = index 1 % 3 = node_1.
+        assert_eq!(val_set.proposer_for(1, 0, &slashing).node_id, node_1);
+        // Height 1 + Round 1 = index 2 % 3 = node_2.
+        assert_eq!(val_set.proposer_for(1, 1, &slashing).node_id, node_2);
+        // Height 1 + Round 2 = index 3 % 3 = node_0.
+        assert_eq!(val_set.proposer_for(1, 2, &slashing).node_id, node_0);
+
+        // Scenario 3: 2 Validators are jailed (Node 2 & Node 3)
+        // Total active power = 20. Quorum is 2 * 20 / 3 + 1 = 14.
+        slashing.jailed.insert(node_2, 100);
+        assert_eq!(val_set.active_total_power(&slashing, 1), 20);
+        assert_eq!(val_set.active_quorum_power(&slashing, 1), 14);
+
+        // Now, the surviving 2 nodes (node_0, node_1) pool 20 power.
+        // Since quorum threshold dynamically dropped to 14, they CAN meet quorum!
+        let mut votes_two_jailed = HashSet::new();
+        votes_two_jailed.insert(node_0);
+        votes_two_jailed.insert(node_1);
+        assert!(val_set.quorum_met(&votes_two_jailed, &slashing, 1), "20/20 active power should successfully meet dynamic quorum!");
+
+        // Proposer round-robin skips node_2 and node_3, cycling only between node_0 and node_1
+        assert_eq!(val_set.proposer_for(1, 0, &slashing).node_id, node_1);
+        assert_eq!(val_set.proposer_for(1, 1, &slashing).node_id, node_0);
+    }
 }

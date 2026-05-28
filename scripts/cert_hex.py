@@ -4,7 +4,6 @@ import binascii
 import re
 import sys
 
-
 def main() -> int:
     if len(sys.argv) != 2:
         print("usage: cert_hex.py <cert.pem>", file=sys.stderr)
@@ -33,7 +32,6 @@ def main() -> int:
 
     print(binascii.hexlify(der).decode("ascii"))
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -12,7 +12,7 @@ fn main() {
     use ed25519_dalek::{Keypair, PublicKey, SecretKey};
     use std::env;
     use std::fs;
-    use std::sync::{mpsc, Arc, RwLock};
+    use std::sync::{Arc, RwLock, mpsc};
 
     let mut genesis_path: Option<String> = None;
     let mut key_hex: Option<String> = None;
@@ -43,13 +43,15 @@ fn main() {
 
     let genesis_path = genesis_path.expect("missing --genesis");
     let genesis_bytes = fs::read_to_string(&genesis_path).expect("read genesis");
-    let genesis: GenesisConfig =
-        serde_json::from_str(&genesis_bytes).expect("parse genesis json");
+    let genesis: GenesisConfig = serde_json::from_str(&genesis_bytes).expect("parse genesis json");
 
     let secret_hex = if let Some(h) = key_hex {
         h
     } else if let Some(path) = key_file {
-        fs::read_to_string(path).expect("read key file").trim().to_string()
+        fs::read_to_string(path)
+            .expect("read key file")
+            .trim()
+            .to_string()
     } else {
         panic!("missing --key-hex or --key-file");
     };
@@ -101,7 +103,12 @@ fn main() {
     .expect("network start");
     net.connect_peers(&validators);
 
-    start_http_server(client_addr.clone(), Arc::clone(&snapshot), tx_cmd.clone());
+    start_http_server(
+        client_addr.clone(),
+        Arc::clone(&snapshot),
+        tx_cmd.clone(),
+        Some(data_dir.clone()),
+    );
 
     let node = Node::new(
         genesis,
@@ -137,8 +144,7 @@ fn load_tls_identity(
 
     let key_file = File::open(key_path).map_err(|e| format!("{}", e))?;
     let mut key_reader = BufReader::new(key_file);
-    let keys =
-        rustls_pemfile::pkcs8_private_keys(&mut key_reader).map_err(|e| format!("{}", e))?;
+    let keys = rustls_pemfile::pkcs8_private_keys(&mut key_reader).map_err(|e| format!("{}", e))?;
     if keys.is_empty() {
         return Err("no pkcs8 private key found".into());
     }

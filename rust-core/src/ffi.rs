@@ -504,7 +504,9 @@ pub extern "C" fn dvel_ledger_link_event(
         }
     };
 
-    if let Some(hash) = maybe_hash && !out_hash.is_null() {
+    if let Some(hash) = maybe_hash
+        && !out_hash.is_null()
+    {
         unsafe {
             *out_hash = from_hash(&hash);
         }
@@ -868,5 +870,52 @@ pub extern "C" fn dvel_ledger_merkle_root(
                 false
             }
         }
+    }
+}
+
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct dvel_mmr_proof_t {
+    pub leaf_index: u64,
+    pub leaf_count: u64,
+    pub siblings: [dvel_hash_t; 64],
+    pub siblings_count: u32,
+    pub sibling_is_right: [bool; 64],
+    pub peaks: [dvel_hash_t; 64],
+    pub peaks_count: u32,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dvel_mmr_verify_proof(
+    trusted_root: *const dvel_hash_t,
+    leaf_hash: *const dvel_hash_t,
+    proof: *const dvel_mmr_proof_t,
+) -> bool {
+    if trusted_root.is_null() || leaf_hash.is_null() || proof.is_null() {
+        return false;
+    }
+    unsafe {
+        let root = to_hash(&*trusted_root);
+        let leaf = to_hash(&*leaf_hash);
+        let p = &*proof;
+
+        let mut siblings = Vec::with_capacity(p.siblings_count as usize);
+        for i in 0..(p.siblings_count as usize).min(64) {
+            siblings.push((p.siblings[i].bytes, p.sibling_is_right[i]));
+        }
+
+        let mut peaks = Vec::with_capacity(p.peaks_count as usize);
+        for i in 0..(p.peaks_count as usize).min(64) {
+            peaks.push(p.peaks[i].bytes);
+        }
+
+        let mmr_proof = crate::mmr::MmrProof {
+            leaf_index: p.leaf_index,
+            leaf_count: p.leaf_count,
+            siblings,
+            peaks,
+        };
+
+        mmr_proof.verify(&root, &leaf)
     }
 }

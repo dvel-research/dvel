@@ -2,7 +2,7 @@
 //
 // Tests consensus recovery after network partition.
 //
-// **KNOWN LIMITATION**: Pure DAG systems without finality gadgets cannot
+// KNOWN LIMITATION: Pure DAG systems without finality gadgets cannot
 // automatically resolve balanced partitions. Both sub-networks create valid
 // chains, and without checkpointing or finality voting (GRANDPA/Casper),
 // the protocol has no rule to choose a winner.

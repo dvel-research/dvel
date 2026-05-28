@@ -16,5 +16,12 @@ Makefile
 *.out.*
 trace_*.json
 
+# Python bytecache
+__pycache__/
+*.pyc
+
+# Deployment artifacts (keys, certs, generated configs)
+dist/
+
 # BFT node data
 data/

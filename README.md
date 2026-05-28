@@ -1,139 +1,116 @@
-# DVEL Reference (v0.1.3)
+# DVEL: Byzantine Fault-Tolerant Deterministic Event Ledger (v0.1.4)
 
-Deterministic, in-memory event ledger with staking, slashing, and hybrid threading. Exposed over C ABI for C++ simulations. Audit-first design (traceable hashes/Merkle roots).
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Consensus: BFT](https://img.shields.io/badge/Consensus-mTLS%20BFT-blue.svg)]()
+[![Hardware: ESP32](https://img.shields.io/badge/Observer-ESP32%20FreeRTOS-green.svg)]()
 
-## v0.1.3 changes
-- **Attack resistance**: Comprehensive security validation suite (4 attack scenarios)
-  - Eclipse, 51% Byzantine, Sybil flood, Network partition - ALL RESISTED
-- **Adaptive recovery**: Dynamic thresholds for partition healing (90% of majority size)
-- **Stake-weighted consensus**: All simulations use `preferred_tip()` for proper tip selection
-- **Security hardening**: Validated cryptographic signatures, timestamp monotonicity, equivocation quarantine
+DVEL is an academic-grade, high-performance **hybrid distributed ledger technology (DLT)**. It features a Directed Acyclic Graph (DAG) for real-time, asynchronous event logging and secures it via a linear, permissioned **Byzantine Fault-Tolerant (BFT) Consensus Blockchain** utilizing mutual TLS (mTLS) transport. 
 
-## v0.1.2 changes
-- Hybrid threading model: parallel signature verification with deterministic state application
-- Performance: 2-4x throughput improvement on multi-core systems (compile with `--features parallel`)
-- Maintains determinism: validation parallelized, ledger application single-threaded
+This repository implements the Rust core ledger, C-ABI FFI wrapper, C++ simulator/benchmarks suite, Python secure archiving scripts, and the dual-core ESP32 TFT observer firmware.
 
-## v0.1.1 changes
-- Validator staking (configurable per-validator)
-- Automatic double-sign detection and slashing (5% penalty default)
-- Jail mechanism (1000 blocks default)
-- Economic penalties in SybilOverlay
+---
 
-See `docs/staking_and_slashing.md` for slashing implementation.
+## System Documentation
 
-## What it does
-- **Events**: single-parent DAG with hash identity `H = SHA256(C(event) || signature)`, where `C` omits the signature slot.
-- **Ledger**: linkage-aware insert (rejects duplicates/missing parents), tips tracking, Merkle root over all event hashes.
-- **Validation**: protocol version, ed25519 signature, bounded timestamp skew (monotonic within a per-author context).
-- **Sybil overlay**: latest-per-author weights plus quarantine + economic slashing on equivocation.
-- **BFT Consensus**: Tendermint-style with staking, automatic slashing, and jail mechanism.
-- **Storage helper**: chunk/sign/verify files, compute manifest hash and chunk Merkle root for anchoring/audit.
+All architectural specifications, cryptographic parameters, authority reputation rules, and hardware configurations are consolidated in the technical paper:
+> **[DVEL Technical Specification & Architecture Whitepaper](docs/dvel_technical_paper.md)**
+> Read this for detailed mathematical formulas of the Merkle Mountain Range (MMR) validation, mTLS handshake specifications, and authority weight penalization and jailing conditions.
 
-## Build & run
+---
+
+## Core Features
+
+*   **Hybrid Topology**: DAG Event ingestion for zero-latency hardware logging, anchored dynamically into a Tendermint-style linear BFT blockchain.
+*   **mTLS Network Transport**: Strict SubjectAltName DER validator certificate checks inside peering loops to resist Man-in-the-Middle and Eclipse attacks.
+*   **Consortium Security (Authority Weight & Jailing)**: Automatic double-signing detection via vote history database, initiating an immediate 5% validator authority weight penalty and a 1000-block jail sentence.
+*   **Secure Archival & Gossip replication (Chunk Sync)**: 
+    *   Slices files into equal chunks and creates signed Ed25519 manifests.
+    *   **Gossip Storage Engine**: Uploaded chunks are replicated across all validator nodes in the BFT cluster using the existing secure mTLS peering network.
+    *   **Automatic Fallback Recovery**: If the primary validator node is offline or fails, the client dynamically queries surviving BFT validators, downloads the missing chunks, verifies SHA256 integrity, and reassembles the file seamlessly.
+*   **Hardware Telemetry Observer**: Standalone ESP32 firmware utilizing dual-core FreeRTOS to poll BFT nodes over Wi-Fi and render interactive DAG graphs at 40+ FPS on TFT LCD screens.
+
+---
+
+## Build & Run Commands
+
+### 1. Compile & Test Rust Core
 ```bash
-# Rust core tests (includes FFI/storage integration)
+# Run standard ledger tests (includes FFI and storage integration)
 cargo test --release -p rust_core
 
-# With parallel verification (hybrid threading)
+# Run tests with parallel signature verification (hybrid threading mode)
 cargo test --release -p rust_core --features parallel
 
-# BFT node with parallel validation
-cargo build --release --features bft,parallel
+# Run the BFT throughput benchmarks (Rust Rayon validation)
+cd rust-core
+cargo bench --bench bft_throughput --features bft              # Single-threaded
+cargo bench --bench bft_throughput --features bft,parallel     # Parallel Rayon
+```
 
-# Benchmark (C++ calling FFI)
+### 2. Compile C++ Simulations & Benchmarks (FFI-Connected)
+```bash
+# Build & Run C++ baseline performance benchmarks
 cmake -S benchmarks -B benchmarks/build
 cmake --build benchmarks/build
 ./benchmarks/build/benchmark
 
-# BFT throughput benchmark (Rust, tests parallel validation)
-cd rust-core
-cargo bench --bench bft_throughput --features bft              # single-threaded: ~12.9k events/sec
-cargo bench --bench bft_throughput --features bft,parallel     # parallel: ~25.9k events/sec (2x speedup)
-
-# Simulator executables (C++ calling FFI)
+# Build & Run C++ Multi-peer simulations (sim_baseline, sim_scheduler, sim_sybil, etc.)
 cmake -S cpp-sim -B cpp-sim/build
 cmake --build cpp-sim/build
-./cpp-sim/build/sim_baseline   # see also sim_scenario, sim_scheduler, sim_metrics, sim_sybil
+./cpp-sim/build/sim_baseline
+```
 
-# Government ledger (production, configurable nodes)
-./cpp-sim/build/gov_ledger --nodes 38 --ticks 100 --audit
-
-# Attack scenarios (experimental/research)
-./cpp-sim/build/sim_attack_eclipse        # Test eclipse attack resistance
-./cpp-sim/build/sim_attack_51percent      # Test BFT threshold (30% Byzantine)
-./cpp-sim/build/sim_attack_sybil_flood --honest 5 --sybil 10  # Test sybil resistance
-./cpp-sim/build/sim_attack_partition      # Test partition recovery (WARNING: finds vulnerability)
-
-# Full smoke (cargo tests + all C++ binaries)
-./scripts/smoke.sh
-
-# Minimal FFI example (C++)
-cmake -S examples -B examples/build
-cmake --build examples/build
-./examples/build/ffi_minimal
-
-# Permissioned BFT node (experimental)
+### 3. Launch Permissioned mTLS BFT Validator Node
+```bash
 cargo run --release --features bft --bin dvel-bft-node \
   --genesis /path/to/genesis.json \
-  --key-hex <32-byte-secret-hex> \
+  --key-hex <32-byte-secret-key-hex> \
   --listen 127.0.0.1:9001 \
   --client 127.0.0.1:7001 \
   --data-dir /path/to/node-data \
   --tls-cert /path/to/node.crt \
   --tls-key /path/to/node.key
 ```
-If `transport.tls_enabled` is true in `genesis.json`, each validator must include
-`tls_cert_hex` (DER hex); the cert must include the listen host in SAN (IP or DNS) and
-should be self-signed CA or chain to a private CA used as a trust anchor.
-You can generate a self-signed cert with `openssl`:
-`./scripts/gen_tls_selfsigned.sh /path/to/out 127.0.0.1 node1`
-If `--data-dir` is omitted, the node stores snapshots under `data/<node_id_hex>`.
-Snapshots are stored as `bft_snapshot.json` inside the data directory.
+> [!NOTE]
+> If `transport.tls_enabled` is active in `genesis.json`, validators must present DER certificates allowlisted in genesis, with SAN matching their listen IP.
 
-## FFI surface
-Header: `include/dvel_ffi.h` (see `docs/ffi_reference.md` for details).
-- Ledger: `dvel_ledger_link_event`, `dvel_ledger_get_event`, `dvel_ledger_get_tips`, `dvel_ledger_merkle_root`, `dvel_hash_event_struct`.
-- Validation/keys: `dvel_validate_event`, `dvel_sign_event`, `dvel_derive_pubkey_from_secret`, `dvel_set_max_backward_skew`.
-- Sybil/trace: `dvel_sybil_overlay_*`, `dvel_select_preferred_tip_sybil`, `dvel_trace_recorder_*`.
-- Storage: `dvel_storage_chunk_file`, `dvel_storage_download`, `dvel_storage_manifest_hash`, `dvel_storage_chunk_merkle_root`, `dvel_storage_last_error`.
-
-## CI checklist (recommended)
-- `cargo fmt` and `cargo clippy --release -- -D warnings`
-- `cargo test --release -p rust_core`
-- `./scripts/smoke.sh`
-
-## BFT design notes
-See `docs/bft_design.md` for protocol parameters, genesis format, and API usage.
-
-## Design sketch (why it’s deterministic)
-- No wall-clock reads: time is injected (`timestamp`/`tick`).
-- No randomness: hashes/signatures deterministic; sha256 + ed25519.
-- No shared mutable globals: ledger/overlay are caller-owned handles.
-- Merkle root over sorted event hashes gives a stable commitment for audit.
-
-## Government transparency deployment
-**gov_ledger**: production-ready configurable system for distributed government ledger.
-
-Usage:
+### 4. Government Ledger Transparency Simulation
+The `gov_ledger` binary showcases anti-corruption, Byzantine-fault-tolerant ledger distribution at scale:
 ```bash
-./cpp-sim/build/gov_ledger --nodes 38 --ticks 100    # baseline (Indonesia provinces)
-./cpp-sim/build/gov_ledger --nodes 40 --ticks 100    # scales with province changes
-./cpp-sim/build/gov_ledger --audit                   # full transparency mode
+# Execute simulation with 38 Indonesian provinces
+./cpp-sim/build/gov_ledger --nodes 38 --ticks 100
+
+# Execute in full transparency audit mode
+./cpp-sim/build/gov_ledger --audit
 ```
 
-Anti-corruption guarantees:
-- Full mesh topology: every node validates every transaction (no single point of failure)
-- Immutable ledger: distributed across all nodes, cannot hide/modify transactions
-- Consensus requirement: 90%+ agreement needed (33%+ nodes required to attack)
-- Public verification: audit trail accessible for transparency
+---
 
-Results (38 nodes): 100% consensus, high availability confirmed.
+## Attack Scenarios & Research
+Validate the network's resilience under adverse environments using C++ simulation executables:
+```bash
+# Eclipse Attack: honest node isolation resistance
+./cpp-sim/build/sim_attack_eclipse
 
-Performance (BFT block processing):
-- Single-threaded: 12.9k events/sec
-- Parallel (rayon): 25.9k events/sec
-- Speedup: 2.01x (verified on 4-core system)
-- Test: `cd rust-core && cargo bench --bench bft_throughput --features bft,parallel`
+# 51% Byzantine Attack: safety limits check (30% Byzantine threshold)
+./cpp-sim/build/sim_attack_51percent
 
-Test files (`sim_*.cpp`) for protocol validation; `gov_ledger.cpp` for production deployment.
+# Sybil Flood Attack: proof of authority-weight-weighted resistance
+./cpp-sim/build/sim_attack_sybil_flood --honest 5 --sybil 10
+
+# Network Partition Attack: adaptive minority healing thresholds
+./cpp-sim/build/sim_attack_partition
+```
+
+---
+
+## FFI API Interface
+DVEL exposes all capabilities over a standard C-ABI wrapper header at `include/dvel_ffi.h`:
+*   **Ledger Interface**: `dvel_ledger_link_event()`, `dvel_ledger_merkle_root()`, `dvel_ledger_get_tips()`.
+*   **Authority & Overlay**: `dvel_sybil_overlay_init()`, `dvel_select_preferred_tip_sybil()`.
+*   **Storage Core FFI**: `dvel_storage_chunk_file()`, `dvel_storage_download()`, `dvel_storage_manifest_hash()`.
+
+---
+
+## License
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

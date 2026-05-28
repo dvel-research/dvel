@@ -30,8 +30,8 @@ impl SnapshotStore {
             return Ok(None);
         }
         let data = fs::read(&self.path).map_err(|e| format!("{}", e))?;
-        let snap = serde_json::from_slice::<PersistedSnapshot>(&data)
-            .map_err(|e| format!("{}", e))?;
+        let snap =
+            serde_json::from_slice::<PersistedSnapshot>(&data).map_err(|e| format!("{}", e))?;
         Ok(Some(snap))
     }
 

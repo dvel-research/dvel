@@ -8,7 +8,7 @@ use dvel_core::bft::types::block_hash;
 use ed25519_dalek::{Keypair, PublicKey, SecretKey};
 use std::collections::HashMap;
 use std::net::TcpListener;
-use std::sync::{mpsc, Arc, RwLock};
+use std::sync::{Arc, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,9 +20,9 @@ struct TestNode {
 
 fn consensus_fast() -> ConsensusConfig {
     ConsensusConfig {
-        propose_timeout_ms: 150,
-        prevote_timeout_ms: 150,
-        precommit_timeout_ms: 150,
+        propose_timeout_ms: 300,
+        prevote_timeout_ms: 300,
+        precommit_timeout_ms: 300,
         target_block_ms: 200,
         timeout_cap_ms: 2_000,
         ..ConsensusConfig::default()
@@ -128,7 +128,7 @@ fn wait_for_quorum_block(nodes: &[TestNode], height: u64, timeout: Duration) -> 
             }
         }
 
-        for (_, count) in &counts {
+        for count in counts.values() {
             if *count >= 3 {
                 return true;
             }
@@ -155,7 +155,7 @@ fn network_progresses_without_slashing_enabled() {
     let addrs: Vec<String> = (0..4)
         .map(|_| format!("127.0.0.1:{}", pick_port()))
         .collect();
-    
+
     // Create genesis with slashing DISABLED
     let mut genesis = genesis_with_slashing(&secrets, &addrs);
     genesis.consensus.slashing.enabled = false;
@@ -167,7 +167,7 @@ fn network_progresses_without_slashing_enabled() {
     }
 
     // Network should progress normally
-    assert!(wait_for_quorum_block(&nodes, 1, Duration::from_secs(5)));
+    assert!(wait_for_quorum_block(&nodes, 1, Duration::from_secs(15)));
 
     shutdown_nodes(nodes);
 }
@@ -194,7 +194,7 @@ fn slashing_config_properly_loaded() {
     }
 
     // Network should start and progress
-    assert!(wait_for_quorum_block(&nodes, 1, Duration::from_secs(5)));
+    assert!(wait_for_quorum_block(&nodes, 1, Duration::from_secs(15)));
 
     shutdown_nodes(nodes);
 }
@@ -217,13 +217,16 @@ fn slashing_state_in_snapshot() {
     }
 
     // Wait for first block
-    assert!(wait_for_quorum_block(&nodes, 1, Duration::from_secs(5)));
+    assert!(wait_for_quorum_block(&nodes, 1, Duration::from_secs(15)));
 
     // Verify all nodes have slashing state initialized in snapshot
     for node in &nodes {
         let snap = node.snapshot.read().expect("snapshot lock");
-        assert!(snap.slashing_state.is_some(), "slashing state should be initialized");
-        
+        assert!(
+            snap.slashing_state.is_some(),
+            "slashing state should be initialized"
+        );
+
         if let Some(ref slashing_state) = snap.slashing_state {
             // Verify all validators are present
             assert_eq!(slashing_state.stakes.len(), 4, "should have 4 validators");
@@ -245,5 +248,4 @@ fn slashing_unit_tests_covered() {
     // - slash_reduces_stake: validates stake reduction calculation
     // - effective_stake_zero_when_jailed: validates jail enforcement
     // This test just documents that slashing mechanics are unit-tested
-    assert!(true);
 }

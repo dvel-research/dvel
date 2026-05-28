@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, 0.1.x ]
+  pull_request:
+    branches: [ main, master, 0.1.x ]
+
+jobs:
+  rust-core:
+    name: Rust Core Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust-core/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+
+      - name: Check code formatting
+        run: cargo fmt --manifest-path rust-core/Cargo.toml -- --check
+
+      - name: Cargo clippy linting
+        run: cargo clippy --manifest-path rust-core/Cargo.toml --features "bft parallel" -- -D warnings
+
+      - name: Run unit & integration tests
+        run: cargo test --manifest-path rust-core/Cargo.toml --features "bft parallel"

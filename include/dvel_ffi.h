@@ -1,13 +1,4 @@
-// DVEL Reference Implementation FFI (c ABI)
-//
-// Goals:
-// - Minimal surface area
-// - No heap allocations crossing the FFI boundary
-// - Deterministic behavior (no time, no RNG)
-//
-// Non-goals:
-// - Production hardening
-// - Cryoptographic security (dummy signature for now)
+// DVEL Reference Implementation FFI (C ABI)
 
 #pragma once
 
@@ -224,6 +215,24 @@ extern "C"
     // Signing helper (ed25519). Signs canonical event bytes with the provided 32-byte secret key.
     // Writes the signature into out_sig.
     void dvel_sign_event(const dvel_event_t *event, const dvel_hash_t *secret_key, dvel_sig_t *out_sig);
+
+    // ---------------- MMR (Merkle Mountain Range) Proofs ----------------
+    typedef struct
+    {
+        uint64_t leaf_index;
+        uint64_t leaf_count;
+        dvel_hash_t siblings[64];
+        uint32_t siblings_count;
+        bool sibling_is_right[64];
+        dvel_hash_t peaks[64];
+        uint32_t peaks_count;
+    } dvel_mmr_proof_t;
+
+    // Verify an MMR inclusion proof against a trusted MMR root hash.
+    bool dvel_mmr_verify_proof(
+        const dvel_hash_t *trusted_root,
+        const dvel_hash_t *leaf_hash,
+        const dvel_mmr_proof_t *proof);
 
     // ---------------- Storage (chunk/manifest/sign/verify) ----------------
     // Copies last error string into buf (NUL-terminated if space). Returns full length of the message.

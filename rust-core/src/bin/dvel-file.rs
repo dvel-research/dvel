@@ -92,7 +92,9 @@ fn handle_download(args: &[String]) -> Result<(), String> {
     }
 
     let manifest = read_manifest(&manifest_path).map_err(|e| format!("{}", e))?;
-    if let Some(exp) = expect_signer && manifest.signer != Some(exp) {
+    if let Some(exp) = expect_signer
+        && manifest.signer != Some(exp)
+    {
         return Err("manifest signer does not match expected key".into());
     }
 

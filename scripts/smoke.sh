@@ -37,7 +37,7 @@ run_and_check() {
   local workdir="$3"
   shift 3 || true
   log "Running $label"
-  # Capture output for lightweight checks.
+
   local out
   if [[ -n "$workdir" ]]; then
     out="$(cd "$workdir" && eval "$cmd")"
@@ -45,7 +45,7 @@ run_and_check() {
     out="$(eval "$cmd")"
   fi
   printf '%s\n' "$out"
-  while [[ $# -gt 0 ]]; do
+  while [[ $
     local needle="$1"
     if ! grep -Fq "$needle" <<<"$out"; then
       log "FAILED: did not find \"$needle\" in $label output"

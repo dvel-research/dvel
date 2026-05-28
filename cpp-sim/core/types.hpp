@@ -1,11 +1,10 @@
-// Deterministic sim types (FFI-facing)
-
 #pragma once
 
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
 #include <cstdio>
+#include <string>
 
 #include "../../include/dvel_ffi.h"
 
@@ -81,6 +80,28 @@ namespace dvelsim
         for (size_t i = 0; i < 64; i++)
             s.bytes[i] = (uint8_t)(tag + (uint8_t)i);
         return s;
+    }
+
+    inline std::string hash_to_hex(const dvel_hash_t &h)
+    {
+        char buf[65];
+        for (int i = 0; i < 32; ++i)
+        {
+            std::sprintf(buf + i * 2, "%02x", h.bytes[i]);
+        }
+        buf[64] = '\0';
+        return std::string(buf);
+    }
+
+    inline std::string pubkey_to_hex(const dvel_pubkey_t &pk)
+    {
+        char buf[65];
+        for (int i = 0; i < 32; ++i)
+        {
+            std::sprintf(buf + i * 2, "%02x", pk.bytes[i]);
+        }
+        buf[64] = '\0';
+        return std::string(buf);
     }
 
     inline void print_hash_prefix(const char *label, const dvel_hash_t &h)

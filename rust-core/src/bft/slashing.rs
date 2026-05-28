@@ -4,19 +4,64 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Tracks validator stakes and slashing history
+/// Tracks validator authority weights, reputation scores, and penalization/jailing history.
+///
+/// Note: In the DVEL Proof of Authority (PoA) model, there is no economic staking.
+/// The `stakes` and `original_stakes` fields are mapped conceptually to **Validator Authority Weights**
+/// or **Reputation Scores** (loaded from genesis and managed dynamically via penalties and jailing).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SlashingState {
-    /// Current stake per validator (after slashing)
+    /// Current authority weight per validator (after penalization)
+    #[serde(with = "serde_node_id_map")]
     pub stakes: HashMap<NodeId, u64>,
-    /// Original stake (immutable)
+    /// Original authority weight (immutable initial reputation)
+    #[serde(with = "serde_node_id_map")]
     pub original_stakes: HashMap<NodeId, u64>,
-    /// Slashing records
+    /// Weight penalization and slashing records
     pub slashed: Vec<SlashingRecord>,
     /// Validators in jail (node_id -> release_height)
+    #[serde(with = "serde_node_id_map")]
     pub jailed: HashMap<NodeId, u64>,
     /// Vote tracking for double-sign detection: (height, round, vote_type) -> (node_id -> vote)
+    #[serde(skip)]
     votes_by_validator: HashMap<(u64, u64, VoteType), HashMap<NodeId, SignedVote>>,
+}
+
+pub mod serde_node_id_map {
+    use super::NodeId;
+    use serde::{self, Deserialize, Deserializer, Serializer};
+    use std::collections::HashMap;
+
+    pub fn serialize<S>(map: &HashMap<NodeId, u64>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map_ser = serializer.serialize_map(Some(map.len()))?;
+        for (k, v) in map {
+            let k_hex = hex::encode(k);
+            map_ser.serialize_entry(&k_hex, v)?;
+        }
+        map_ser.end()
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<HashMap<NodeId, u64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let hex_map = HashMap::<String, u64>::deserialize(deserializer)?;
+        let mut map = HashMap::new();
+        for (k_hex, v) in hex_map {
+            let bytes = hex::decode(&k_hex).map_err(serde::de::Error::custom)?;
+            if bytes.len() != 32 {
+                return Err(serde::de::Error::custom("NodeId must be 32 bytes"));
+            }
+            let mut node_id = [0u8; 32];
+            node_id.copy_from_slice(&bytes);
+            map.insert(node_id, v);
+        }
+        Ok(map)
+    }
 }
 
 impl SlashingState {
@@ -39,7 +84,7 @@ impl SlashingState {
         }
     }
 
-    /// Get effective stake (returns 0 if jailed)
+    /// Get effective authority weight (returns 0 if jailed)
     pub fn effective_stake(&self, validator_id: &NodeId, current_height: u64) -> u64 {
         if self.is_jailed(validator_id, current_height) {
             return 0;
@@ -60,8 +105,8 @@ impl SlashingState {
 
         let v = &vote.vote;
         let key = (v.height, v.round, v.vote_type);
-        
-        let votes = self.votes_by_validator.entry(key).or_insert_with(HashMap::new);
+
+        let votes = self.votes_by_validator.entry(key).or_default();
 
         // Check for double-signing: same height/round/type but different block hash
         if let Some(existing) = votes.get(&v.validator_id) {
@@ -86,13 +131,14 @@ impl SlashingState {
         // Clean up old votes (keep last 100 heights)
         if v.height > 100 {
             let old_height = v.height - 100;
-            self.votes_by_validator.retain(|(h, _, _), _| *h > old_height);
+            self.votes_by_validator
+                .retain(|(h, _, _), _| *h > old_height);
         }
 
         None
     }
 
-    /// Apply slashing for evidence
+    /// Apply weight penalization (slashing) for evidence of a consensus violation
     pub fn slash(
         &mut self,
         evidence: SlashingEvidence,
@@ -100,7 +146,7 @@ impl SlashingState {
         current_height: u64,
     ) -> Result<SlashingRecord, String> {
         if !config.enabled {
-            return Err("slashing disabled".into());
+            return Err("penalization disabled".into());
         }
 
         let (validator_id, slash_percent) = match &evidence {
@@ -114,17 +160,17 @@ impl SlashingState {
 
         let current_stake = self.stakes.get(&validator_id).copied().unwrap_or(0);
         if current_stake == 0 {
-            return Err("validator already has zero stake".into());
+            return Err("validator already has zero authority weight".into());
         }
 
-        // Calculate slashing amount (percentage of current stake)
+        // Calculate penalization amount (percentage of current authority weight)
         let slash_amount = current_stake.saturating_mul(slash_percent) / 100;
         let new_stake = current_stake.saturating_sub(slash_amount);
 
-        // Update stake
+        // Update authority weight
         self.stakes.insert(validator_id, new_stake);
 
-        // Jail validator
+        // Jail validator (demoting effective power to 0)
         let jail_until = current_height.saturating_add(config.jail_duration_blocks);
         self.jailed.insert(validator_id, jail_until);
 
@@ -145,7 +191,7 @@ impl SlashingState {
         Ok(record)
     }
 
-    /// Get total slashed amount for a validator
+    /// Get total penalized authority weight for a validator
     pub fn total_slashed(&self, validator_id: &NodeId) -> u64 {
         let original = self.original_stakes.get(validator_id).copied().unwrap_or(0);
         let current = self.stakes.get(validator_id).copied().unwrap_or(0);
@@ -157,8 +203,12 @@ impl SlashingState {
         self.slashed
             .iter()
             .filter(|r| match &r.evidence {
-                SlashingEvidence::DoubleSign { validator_id: vid, .. } => vid == validator_id,
-                SlashingEvidence::InvalidProposal { validator_id: vid, .. } => vid == validator_id,
+                SlashingEvidence::DoubleSign {
+                    validator_id: vid, ..
+                } => vid == validator_id,
+                SlashingEvidence::InvalidProposal {
+                    validator_id: vid, ..
+                } => vid == validator_id,
             })
             .collect()
     }
@@ -170,9 +220,10 @@ impl SlashingState {
                 self.jailed.remove(validator_id);
                 Ok(())
             }
-            Some(&jail_until) => {
-                Err(format!("validator still jailed until height {}", jail_until))
-            }
+            Some(&jail_until) => Err(format!(
+                "validator still jailed until height {}",
+                jail_until
+            )),
             None => Err("validator not jailed".into()),
         }
     }
@@ -244,7 +295,7 @@ mod tests {
         };
 
         let record = state.slash(evidence, &config, 10).unwrap();
-        
+
         // 5% slashed from 1_000_000 = 50_000
         assert_eq!(record.slashed_amount, 50_000);
         assert_eq!(state.stakes.get(&validator_id), Some(&950_000));
@@ -273,7 +324,7 @@ mod tests {
 
         // Jailed - effective stake is 0
         assert_eq!(state.effective_stake(&validator_id, 10), 0);
-        
+
         // After jail - effective stake restored
         assert_eq!(state.effective_stake(&validator_id, 111), 950_000);
     }
