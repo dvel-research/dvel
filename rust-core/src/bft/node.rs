@@ -179,10 +179,12 @@ impl ValidatorSet {
     ) -> bool {
         let mut power = 0u64;
         for id in votes {
-            if !slashing_state.is_jailed(id, height) {
-                if let Some(v) = self.by_id.get(id) {
-                    power = power.saturating_add(v.power);
-                }
+            if let Some(v) = self
+                .by_id
+                .get(id)
+                .filter(|_| !slashing_state.is_jailed(id, height))
+            {
+                power = power.saturating_add(v.power);
             }
         }
         power >= self.active_quorum_power(slashing_state, height)
@@ -727,10 +729,13 @@ impl Node {
         let total_voted_power = {
             let mut power = 0u64;
             for id in entry.iter() {
-                if !self.slashing_state.is_jailed(id, self.height) {
-                    if let Some(val) = self.validators.by_id.get(id) {
-                        power += val.power;
-                    }
+                if let Some(val) = self
+                    .validators
+                    .by_id
+                    .get(id)
+                    .filter(|_| !self.slashing_state.is_jailed(id, self.height))
+                {
+                    power += val.power;
                 }
             }
             power
