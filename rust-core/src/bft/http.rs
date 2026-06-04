@@ -119,6 +119,81 @@ fn handle_client(
             );
             write_json(&mut stream, 200, &resp);
         }
+        ("GET", path) if path.starts_with("/block/") && path.ends_with("/proof") => {
+            let clean_path = path.trim_end_matches("/proof");
+            let height_str = clean_path.trim_start_matches("/block/");
+            if let Ok(h) = height_str.parse::<u64>() {
+                let snap = snapshot.read().unwrap();
+                if let Some(block) = snap.blocks_by_height.get(&h) {
+                    let mut leaf_index = 0u64;
+                    for h_idx in 1..h {
+                        if let Some(b) = snap.blocks_by_height.get(&h_idx) {
+                            for tx in &b.txs {
+                                if decode_event(tx).is_ok() {
+                                    leaf_index += 1;
+                                }
+                            }
+                        }
+                    }
+
+                    let mut first_payload_hash = None;
+                    for tx in &block.txs {
+                        if let Ok(ev) = decode_event(tx) {
+                            first_payload_hash = Some(ev.payload_hash);
+                            break;
+                        }
+                    }
+
+                    if let Some(payload_hash) = first_payload_hash {
+                        if let Some(proof) = snap.mmr.gen_proof(leaf_index) {
+                            let root_hex =
+                                hex_encode(snap.mmr.get_root().unwrap_or(crate::event::ZERO_HASH));
+                            let sibling_proofs: Vec<String> = proof
+                                .siblings
+                                .iter()
+                                .map(|&(sh, is_right)| {
+                                    format!(
+                                        r#"{{"hash":"{}","is_right":{}}}"#,
+                                        hex_encode(sh),
+                                        is_right
+                                    )
+                                })
+                                .collect();
+                            let peak_proofs: Vec<String> = proof
+                                .peaks
+                                .iter()
+                                .map(|&ph| format!(r#""{}""#, hex_encode(ph)))
+                                .collect();
+
+                            let resp = format!(
+                                r#"{{"status":"committed","height":{},"block_hash":"{}","payload_hash":"{}","mmr_root":"{}","leaf_index":{},"leaf_count":{},"siblings":[{}],"peaks":[{}]}}"#,
+                                h,
+                                hex_encode(block_hash(&block.header)),
+                                hex_encode(payload_hash),
+                                root_hex,
+                                proof.leaf_index,
+                                proof.leaf_count,
+                                sibling_proofs.join(","),
+                                peak_proofs.join(",")
+                            );
+                            write_json(&mut stream, 200, &resp);
+                        } else {
+                            write_json(
+                                &mut stream,
+                                500,
+                                r#"{"error":"failed to generate MMR proof"}"#,
+                            );
+                        }
+                    } else {
+                        write_json(&mut stream, 404, r#"{"error":"no transactions in block"}"#);
+                    }
+                } else {
+                    write_json(&mut stream, 404, r#"{"error":"not found"}"#);
+                }
+            } else {
+                write_json(&mut stream, 400, r#"{"error":"bad height"}"#);
+            }
+        }
         ("GET", path) if path.starts_with("/block/") => {
             let height = path.trim_start_matches("/block/");
             if let Ok(h) = height.parse::<u64>() {

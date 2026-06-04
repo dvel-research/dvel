@@ -141,15 +141,16 @@ impl ValidatorSet {
     /// Calculate the active quorum power threshold dynamically (strictly > 2/3 of active power)
     fn active_quorum_power(&self, slashing_state: &SlashingState, height: u64) -> u64 {
         let total = self.active_total_power(slashing_state, height);
-        if total == 0 {
-            0
-        } else {
-            (2 * total) / 3 + 1
-        }
+        if total == 0 { 0 } else { (2 * total) / 3 + 1 }
     }
 
     /// Select proposer dynamically only from the active (unjailed) validator pool
-    fn proposer_for(&self, height: u64, round: u64, slashing_state: &SlashingState) -> &ValidatorInfo {
+    fn proposer_for(
+        &self,
+        height: u64,
+        round: u64,
+        slashing_state: &SlashingState,
+    ) -> &ValidatorInfo {
         let active = self.active_validators(slashing_state, height);
         if active.is_empty() {
             // Fallback to static selection in case of all-jailed catastrophe
@@ -170,7 +171,12 @@ impl ValidatorSet {
     }
 
     /// Check if dynamic quorum is met for a set of votes at a given height
-    fn quorum_met(&self, votes: &HashSet<NodeId>, slashing_state: &SlashingState, height: u64) -> bool {
+    fn quorum_met(
+        &self,
+        votes: &HashSet<NodeId>,
+        slashing_state: &SlashingState,
+        height: u64,
+    ) -> bool {
         let mut power = 0u64;
         for id in votes {
             if !slashing_state.is_jailed(id, height) {
@@ -374,7 +380,9 @@ impl Node {
         if self.step != Step::Propose || self.round_state.proposed {
             return;
         }
-        let proposer = self.validators.proposer_for(self.height, self.round, &self.slashing_state);
+        let proposer = self
+            .validators
+            .proposer_for(self.height, self.round, &self.slashing_state);
         if proposer.node_id != self.node_id {
             return;
         }
@@ -728,7 +736,9 @@ impl Node {
             power
         };
 
-        let active_quorum = self.validators.active_quorum_power(&self.slashing_state, self.height);
+        let active_quorum = self
+            .validators
+            .active_quorum_power(&self.slashing_state, self.height);
         println!(
             "[BFT] Node {:?} handle_vote: {:?} block {:?} now has {}/{} power",
             hex::encode(self.node_id),
@@ -738,7 +748,10 @@ impl Node {
             active_quorum
         );
 
-        if self.validators.quorum_met(entry, &self.slashing_state, self.height) {
+        if self
+            .validators
+            .quorum_met(entry, &self.slashing_state, self.height)
+        {
             println!(
                 "[BFT] Node {:?} handle_vote: quorum met for {:?} block {:?}",
                 hex::encode(self.node_id),
@@ -1095,9 +1108,9 @@ impl Node {
     }
 
     fn verify_proposal(&self, proposal: &Proposal) -> bool {
-        let proposer = self
-            .validators
-            .proposer_for(proposal.height, proposal.round, &self.slashing_state);
+        let proposer =
+            self.validators
+                .proposer_for(proposal.height, proposal.round, &self.slashing_state);
         if proposer.node_id != proposal.proposer_id {
             return false;
         }
@@ -2043,28 +2056,40 @@ mod tests {
         // Total power = 40. Quorum is 2 * 40 / 3 + 1 = 27.
         assert_eq!(val_set.active_total_power(&slashing, 1), 40);
         assert_eq!(val_set.active_quorum_power(&slashing, 1), 27);
-        
+
         let mut votes = HashSet::new();
         votes.insert(node_0);
         votes.insert(node_1);
-        assert!(!val_set.quorum_met(&votes, &slashing, 1), "20/40 power should not meet quorum");
-        
+        assert!(
+            !val_set.quorum_met(&votes, &slashing, 1),
+            "20/40 power should not meet quorum"
+        );
+
         votes.insert(node_2);
-        assert!(val_set.quorum_met(&votes, &slashing, 1), "30/40 power should meet quorum");
+        assert!(
+            val_set.quorum_met(&votes, &slashing, 1),
+            "30/40 power should meet quorum"
+        );
 
         // Scenario 2: 1 Validator is jailed (Node 3)
         // Total active power = 30. Quorum is 2 * 30 / 3 + 1 = 21.
         slashing.jailed.insert(node_3, 100);
         assert_eq!(val_set.active_total_power(&slashing, 1), 30);
         assert_eq!(val_set.active_quorum_power(&slashing, 1), 21);
-        
+
         let mut votes_jailed = HashSet::new();
         votes_jailed.insert(node_0);
         votes_jailed.insert(node_1);
-        assert!(!val_set.quorum_met(&votes_jailed, &slashing, 1), "20/30 power should not meet quorum");
-        
+        assert!(
+            !val_set.quorum_met(&votes_jailed, &slashing, 1),
+            "20/30 power should not meet quorum"
+        );
+
         votes_jailed.insert(node_2);
-        assert!(val_set.quorum_met(&votes_jailed, &slashing, 1), "30/30 power should meet quorum");
+        assert!(
+            val_set.quorum_met(&votes_jailed, &slashing, 1),
+            "30/30 power should meet quorum"
+        );
 
         // Verify proposer round-robin skips jailed node_3
         // Active set: node_0, node_1, node_2.
@@ -2086,7 +2111,10 @@ mod tests {
         let mut votes_two_jailed = HashSet::new();
         votes_two_jailed.insert(node_0);
         votes_two_jailed.insert(node_1);
-        assert!(val_set.quorum_met(&votes_two_jailed, &slashing, 1), "20/20 active power should successfully meet dynamic quorum!");
+        assert!(
+            val_set.quorum_met(&votes_two_jailed, &slashing, 1),
+            "20/20 active power should successfully meet dynamic quorum!"
+        );
 
         // Proposer round-robin skips node_2 and node_3, cycling only between node_0 and node_1
         assert_eq!(val_set.proposer_for(1, 0, &slashing).node_id, node_1);

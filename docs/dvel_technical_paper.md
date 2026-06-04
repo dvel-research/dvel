@@ -185,50 +185,80 @@ $$\text{Folded Root} = \text{SHA256}(\text{Peak A} \parallel \text{Peak B})$$
 
 ---
 
-## 5. Hardware Observer: Dual-Core ESP32 Standalone Telemetry
+### 5. Standalone Cryptographic Auditor: ESP32 Hardware Co-Processor
 
-Telemetry visualization and real-time ledger auditing are delegated to standalone hardware observers (ESP32 controllers with 2.8" ILI9341 TFT displays).
+To achieve trustless execution without delegating verification to external nodes, DVEL leverages standalone ESP32 hardware controllers as active cryptographic auditors rather than passive visualization screens. 
 
 ```
  +-----------------------------------------------------------------------------------+
- |                              ESP32 DUAL-CORE ENGINE                               |
+ |                              ESP32 CRYPTOGRAPHIC ENGINE                           |
  |                                                                                   |
- |   CORE 0: NETWORK POLLING                                                         |
- |   - Polling /tip and /block/<height> directly over Wi-Fi.                         |
- |   - Performs local HTTP Health Checks of validators.                              |
- |   - Semaphore Mutex locks shared ledger state.                                    |
+ |   CORE 0: NETWORK & CRYPTO VERIFICATION                                           |
+ |   - Queries wireless /tip, /block/<h>, and MMR proofs via local Wi-Fi.            |
+ |   - Performs on-chip hardware-accelerated SHA256 path climbing and peak folding.  |
+ |   - Locks ledger state via FreeRTOS Semaphore Mutex.                              |
  |                                                                                   |
- |   CORE 1: REAL-TIME RENDERING                                                     |
- |   - Capped at ~40 FPS.                                                            |
- |   - Double-buffered TFT_eSprite zero-flicker graphics pipeline.                   |
- |   - Renders DAG graph, active consensus tips, and system alerts.                  |
+ |   CORE 1: REAL-TIME DOUBLE-BUFFERED RENDERING                                     |
+ |   - 40+ FPS double-buffered graphics using TFT_eSprite.                           |
+ |   - Renders DAG state, peer weights, and active verification status.              |
+ |   - Blinks visual alarms immediately on consensus or cryptographic compromises.   |
  |                                                                                   |
  +-----------------------------------------------------------------------------------+
 ```
 
-### 5.1 Dual-Core FreeRTOS Tasking Architecture
-To prevent network latency from choking graphical rendering, the ESP32 firmware splits operations across its two hardware cores using FreeRTOS:
-1.  **Core 0 (Network Polling Task)**: Executes the `networkTask` loop. Connects to local Wi-Fi and polls HTTP endpoints (`/tip` and `/block/<height>`) from Node 0. It sequentially pulls blocks and updates ledger metadata.
-2.  **Core 1 (Main Rendering & UI)**: Executes the standard Arduino `loop()` at approximately **40 FPS**. It renders the sliding graphical DAG nodes, displays live tick metrics, preferred tips, and peer weights.
+### 5.1 Dual-Core Task Allocation & Memory Boundaries
 
-Thread-safety between the two cores is guaranteed using a FreeRTOS semaphore mutex (`xMutex`):
+To guarantee that intensive cryptographic climbing loops do not block the 40 FPS graphical pipeline, the observer firmware separates networking/cryptography from graphics rendering across the ESP32’s dual-core Xtensa processor using FreeRTOS:
+1. **Core 0 (Network & Auditing)**: Connects to the local network via the integrated Wi-Fi stack and polls `/tip` every second. When a new BFT block is detected, it requests `/block/<height>` and its associated logarithmic inclusion proof `/block/<height>/proof`. It processes the proof bytes in-memory and executes the climbing validation.
+2. **Core 1 (Double-Buffered Rendering)**: Drives the 2.8" SPI-interfaced ILI9341 display. It consumes the synchronized ledger state to update the sliding DAG nodes, preferred tip markers, and peer weight metrics. 
+
+Thread-safe variables (`currentTick`, `nodeWeights`, `auditedMmrRoot`, `integrityViolated`) are synchronized between cores using a FreeRTOS semaphore mutex (`xMutex`):
 ```cpp
 if (xSemaphoreTake(xMutex, portMAX_DELAY) == pdTRUE) {
-    // Read or write shared variables (currentTick, merkleRoot, nodeWeights)
+    // Synchronize block metrics, audited roots, and alarm triggers
     xSemaphoreGive(xMutex);
 }
 ```
+Graphical memory consumption is kept bounded to prevent heap fragmentation. The dual-buffered sprite allocation is set to a fixed $320 \times 240$ frame size at 8-bit color depth, restricting memory allocations to exactly $76,800$ bytes on the heap. MMR proof parsing is constrained to a static Json Document buffer footprint of $2,548$ bytes.
 
-### 5.2 Dynamic Peer Weights & Sybil Quarantine Alarms
-Core 0 polls the health of three active validators (`17001`, `17002`, `17003`) every 3 seconds:
-*   **Local Health Check**: Sends an HTTP request to `http://<ip>:<port>/tip` with a 1000 ms timeout.
-*   **Weight Penalty**: If the HTTP request succeeds, the peer weight is set to **1000**. If it fails (timeouts/offline), the weight drops to **0**.
-*   **Sybil / Isolation Alarm**: If the weight of Node 2 is marked as `0` (`w == 0`), the observer triggers an orange/red flashing screen alert, logs `"SYBIL ATTACK DETECTED: NODE 2 QUARANTINED!"` to the terminal, and sets `sybilAttackActive = true`. Once Node 2 passes its health check, the observer transitions back to normal green state.
+### 5.2 On-Chip Merkle Mountain Range Path Climbing
 
-### 5.3 Server Reset Synchronization Handling
-To gracefully handle BFT ledger resets (e.g. database wipes), the firmware compares the server's current height (`current_height`) with the observer's historical height (`last_height`). If:
-$$\text{Current Height} < \text{Last Height}$$
-The observer detects the server reset, automatically resets `last_height` to `current_height`, logs `"SERVER RESET. SYNCING..."` to the screen, and restarts smooth block tracking from the new block height without stalling.
+Instead of accepting node telemetry blindly, Core 0 intercepts each block's transaction payload hash and verifies its inclusion in the global blockchain ledger. The ESP32 utilizes its built-in hardware cryptographic accelerator via `mbedtls` APIs to compute the hashes in microseconds.
+
+```
+       [Global MMR Root] (Verified against BFT consensus)
+              ^
+              | (Fold peaks right-to-left)
+     +--------+--------+
+     |                 |
+  [Peak 0]          [Peak 1] (Computed from leaf)
+                       ^
+                       | (Climb siblings)
+                  +----+----+
+                  |         |
+               [Node]   [Sibling 0]
+                  ^
+                  |
+             [Payload Hash] (Target Leaf)
+```
+
+The verification engine climbs the Merkle Mountain Range in two distinct hardware-accelerated phases:
+1. **Logarithmic Path Climbing**: Given a target payload hash $H_{\text{payload}}$ and an array of $K$ sibling hashes, the ESP32 iteratively hashes the current node with the corresponding sibling:
+   $$\text{Next Hash} = \begin{cases} \text{SHA256}(\text{Current} \parallel \text{Sibling}) & \text{if Sibling is on the right} \\ \text{SHA256}(\text{Sibling} \parallel \text{Current}) & \text{if Sibling is on the left} \end{cases}$$
+   This climbs the tree in $O(\log N)$ iterations to derive the local peak hash.
+2. **Right-to-Left Peak Folding**: The computed peak hash is validated against the active peaks list. Once validated, all peaks are folded from right to left using the hardware SHA256 co-processor:
+   $$\text{Folded Root}_{i} = \text{SHA256}(\text{Peak}_i \parallel \text{Folded Root}_{i+1})$$
+   If the resulting `folded_root` matches the `mmr_root` served in the committed block proof, cryptographic finality is successfully audited on-device.
+
+### 5.3 Byzantine Alarm & Quarantine Mitigation
+
+If a compromised or malicious validator node attempts to serve tampered transaction data or fake block headers, the local path climbing or peak folding phase will yield a mismatch:
+$$\text{Computed Folded Root} \neq \text{Expected MMR Root}$$
+
+When an audit failure is detected, the ESP32 transitions into a high-priority quarantine alert mode:
+* **LED HUD Panic State**: Core 1 immediately shifts the telemetry box container boundary and terminal text logs into an emergency red-and-yellow flashing pattern (pulsed at 5 Hz).
+* **Consensus Halt**: The network thread on Core 0 immediately suspends all block synchronization and drops health tracking. The node weights are forced to `HALTED` on the HUD panel to prevent any further interaction.
+* **Telemetry Quarantine**: The system logs a `"CRITICAL: CRYPTO AUDIT FAIL!"` and `"MMR CORRUPTION ON HEIGHT X"` event, permanently locking the screen until a manual reset is executed by the operator.
 
 ---
 
